@@ -1,97 +1,97 @@
 # CIDG
 
-面向 **类增量学习（Class-Incremental Learning, CIL）** 与 **类增量域泛化（Class-Incremental Domain Generalization, CIDG）** 的研究代码库。
+Research code for **Class-Incremental Learning (CIL)** and **Class-Incremental Domain Generalization (CIDG)**.
 
-本仓库在开源工具箱 **[C3Box](https://github.com/LAMDA-CL/C3Box)**（基于 CLIP 的类增量学习框架）之上扩展实现，保留其对多种 CLIP 类增量方法与经典 CIL / ViT 提示类方法的复现与评测能力，并新增：
+This repository extends the open-source **[C3Box](https://github.com/LAMDA-CL/C3Box)** toolbox (a CLIP-based class-incremental learning framework). It keeps reproducibility and evaluation for many CLIP-based and classic CIL / ViT prompting methods, and adds:
 
-1. **CIDG 评测框架**（`dg_bench/`）：在 DomainBed 风格数据集上采用 **留一域（leave-one-domain-out）** 协议，在 **仅未见测试域** 上评估类增量过程，并记录遗忘曲线等日志。
-2. **Zero-Shot Guided Fusion（零样本引导融合）**：在标准 CIL 主流程中，将 **CLIP 零样本 logits** 与 **当前 CIL 模型 logits** 按系数融合，用于提升跨域泛化表现；支持先保存 `zs_clip` 各阶段预测再在任意 CIL 方法上加载融合。
+1. **CIDG evaluation** (`dg_bench/`): DomainBed-style benchmarks with a **leave-one-domain-out** protocol—train on source domains and evaluate class-incremental learning **only on the held-out test domain**, with forgetting curves and logs.
+2. **Zero-Shot Guided Fusion**: In the standard CIL loop, fuse **CLIP zero-shot logits** with **current CIL logits** using a scalar weight to improve cross-domain generalization. Save per-stage `zs_clip` predictions once, then load them for fusion with any CIL method.
 
 ---
 
-## 环境依赖
+## Dependencies
 
-与上游 C3Box 一致，建议版本如下（可按本地 CUDA 调整 PyTorch 版本）：
+Aligned with upstream C3Box; adjust PyTorch builds for your CUDA version as needed.
 
 - Python 3.8+
 - [PyTorch](https://pytorch.org/) 2.x
 - [torchvision](https://github.com/pytorch/vision)
 - [timm](https://github.com/huggingface/pytorch-image-models)
 - [open-clip](https://github.com/mlfoundations/open_clip)
-- tqdm、numpy、scipy、easydict、pandas（用于融合与结果处理）
+- tqdm, numpy, scipy, easydict, pandas (fusion and result handling)
 
 ---
 
-## 标准类增量实验（CIL）
+## Standard class-incremental experiments (CIL)
 
-1. 在 `exps/` 下选择或复制 JSON 配置，设置 `model_name`、`dataset`、`init_cls`、`increment`、`backbone_type` 等。
-2. 运行：
+1. Pick or copy a JSON config under `exps/` and set `model_name`, `dataset`, `init_cls`, `increment`, `backbone_type`, etc.
+2. Run:
 
 ```bash
-python main.py --config=./exps/<配置名>.json
+python main.py --config=./exps/<config_name>.json
 ```
 
-支持的 `model_name` 与 C3Box 一致，例如：`zs_clip`、`simplecil`、`foster`、`memo`、`l2p`、`dual`、`coda`、`ease`、`aper_*`、`tuna`、`rapf`、`clg_cbm`、`proof`、`engine`、`bofa` 等（以 `utils/factory.py` 与 `exps/` 中实际文件为准）。
+Supported `model_name` values match C3Box, e.g. `zs_clip`, `simplecil`, `foster`, `memo`, `l2p`, `dual`, `coda`, `ease`, `aper_*`, `tuna`, `rapf`, `clg_cbm`, `proof`, `engine`, `bofa` (see `utils/factory.py` and files under `exps/`).
 
 ---
 
-## CIDG：域泛化类增量评测（`dg_bench`）
+## CIDG: domain-generalization CIL (`dg_bench`)
 
-在 **数据集根目录** 下按 DomainBed 惯例组织各数据集子文件夹（如 `PACS/`、`VLCS/` 等），运行：
+Organize datasets under a **root folder** following common DomainBed layouts (e.g. `PACS/`, `VLCS/`, …). Then run:
 
 ```bash
-python dg_bench/runner.py --dataset_root <数据根目录> --dataset_name PACS --model_name proof --device 0
+python dg_bench/runner.py --dataset_root <DATA_ROOT> --dataset_name PACS --model_name proof --device 0
 ```
 
-- `--dataset_name` 可选：`PACS`、`VLCS`、`OfficeHome`、`terra_incognita`、`domain_net`。
-- `--val_domain`：指定某一域为测试域；省略则对所有域做留一域遍历。
-- `--seed`：可传多个种子以符合 DomainBed 多随机种子协议。
-- 日志默认写入 `./log/<时间戳>_<实验名>/`，含参数、准确率与遗忘曲线图等。
+- `--dataset_name`: `PACS`, `VLCS`, `OfficeHome`, `terra_incognita`, or `domain_net`.
+- `--val_domain`: fix one domain as test; omit to sweep all domains (leave-one-out).
+- `--seed`: pass multiple seeds for multi-seed protocols (e.g. DomainBed-style runs).
+- Logs go to `./log/<timestamp>_<run_name>/` with arguments, accuracies, and forgetting-curve plots.
 
-更多消融与增强（如图像增强相关参数）见 `dg_bench/runner.py` 的命令行说明。
+See `python dg_bench/runner.py --help` for ablations and options (e.g. image augmentation).
 
 ---
 
-## Zero-Shot Guided Fusion（零样本引导融合）
+## Zero-Shot Guided Fusion
 
-融合公式：**`new_logits = CIL_logits + fuse * ZS_logits`**。
+Fusion rule: **`new_logits = CIL_logits + fuse * ZS_logits`**.
 
-**步骤概览：**
+**Workflow:**
 
-1. **先**用 `model_name=zs_clip` 在 **相同** `dataset`、`seed`、`init_cls`、`increment` 下运行，并开启保存零样本预测：
+1. Run **`zs_clip`** with the **same** `dataset`, `seed`, `init_cls`, and `increment`, and enable saving zero-shot outputs:
 
 ```bash
-python main.py --config=./exps/zs_clip_<数据集>.json --save_zs_predictions
+python main.py --config=./exps/zs_clip_<dataset>.json --save_zs_predictions
 ```
 
-输出目录：`zs_result/<dataset>/seed<seed>_init<init>_inc<inc>/task_*.csv`。
+Outputs: `zs_result/<dataset>/seed<seed>_init<init>_inc<inc>/task_*.csv`.
 
-2. **再**训练你的 CIL 方法，并通过 CLI 或 JSON 传入一个或多个 `fuse` 系数（将自动加载上述目录中的 CSV）：
+2. Train your CIL method and pass one or more **`fuse`** weights via CLI or JSON (CSVs above are loaded automatically):
 
 ```bash
-python main.py --config=./exps/<你的方法>.json --fuse 0.5 1.0 1.5
+python main.py --config=./exps/<your_method>.json --fuse 0.5 1.0 1.5
 ```
 
-多组 `fuse` 会分别记录曲线。可用 `plot_cil_fuse_results.py` 对 `results/cil_fuse` 等目录下的结果做汇总与可视化（见脚本内说明）。
+Each `fuse` value is logged as its own curve. Use `plot_cil_fuse_results.py` to aggregate or plot results under `results/cil_fuse` (see the script for details).
 
-**CIDG 路径**：`dg_bench/runner.py` 同样支持 `--fuse` / `--save_zs_predictions`，流程与上类似，需保证路径与任务划分一致。
-
----
-
-## 数据集（标准 CIL）
-
-- **CIFAR-100**：可由代码自动下载。
-- 其余数据集（CUB-200、ImageNet-R、ObjectNet、Aircraft、Food 等）需自行准备；**非 CIFAR** 时请在 `utils/data.py` 的 `download_data` 中配置你的 `train/` 与 `val/` 路径。
-
-各数据集版权与分发条款以原始发布方为准；本仓库仅提供加载与评测代码。
+**CIDG path:** `dg_bench/runner.py` also supports `--fuse` / `--save_zs_predictions` with the same idea; keep paths and task splits consistent.
 
 ---
 
-## 引用
+## Datasets (standard CIL)
 
-### 使用本仓库时，请引用 C3Box 原论文（上游要求）
+- **CIFAR-100**: downloaded automatically by the code.
+- Other sets (CUB-200, ImageNet-R, ObjectNet, Aircraft, Food, …): prepare locally. For **non-CIFAR** runs, set your `train/` and `val/` roots in `download_data` inside `utils/data.py`.
 
-若你的工作基于或使用了 C3Box 代码与设定，请引用：
+Licensing and redistribution of each dataset follow the original publishers; this repo only provides loading and evaluation code.
+
+---
+
+## Citation
+
+### C3Box (required when using their code or setup)
+
+If you build on C3Box, please cite:
 
 ```bibtex
 @article{sun2026c3box,
@@ -102,27 +102,25 @@ python main.py --config=./exps/<你的方法>.json --fuse 0.5 1.0 1.5
 }
 ```
 
-C3Box 文中亦建议关注类增量与持续学习综述，可按需引用其 README 中的 [Zhou et al., IJCAI 2024]、[Zhou et al., TPAMI 2024] 等条目。
+The C3Box README also lists related surveys (e.g. Zhou et al., IJCAI 2024; Zhou et al., TPAMI 2024)—cite them if relevant.
 
-### 若你发表基于 **本 CIDG 扩展** 的工作
+### This repository’s CIDG extensions
 
-请在文中说明代码基于 C3Box 扩展，并同时引用 C3Box；对本仓库新增的 CIDG 评测与融合模块，请按你的论文信息撰写 bibtex（此处不代写正式条目）。
-
----
-
-## 致谢
-
-- 核心 CIL 实现与基准来自 **[C3Box](https://github.com/LAMDA-CL/C3Box)**（LAMDA-CL）。
-- 工程上参考 **[PyCIL](https://github.com/G-U-N/PyCIL)**、**[LAMDA-PILOT](https://github.com/LAMDA-CL/LAMDA-PILOT)** 等社区项目。
+If you publish work that uses the **CIDG benchmark or fusion modules** added here, state that the code extends C3Box and keep the C3Box citation above; add your own paper’s bib entry for the new contribution.
 
 ---
 
-## 许可证
+## Acknowledgments
 
-见仓库根目录 `LICENSE`（MIT）。使用第三方数据集与预训练权重时，请遵守其各自许可协议。
+- Core CIL implementations and baselines from **[C3Box](https://github.com/LAMDA-CL/C3Box)** (LAMDA-CL).
+- Engineering ideas from community projects such as **[PyCIL](https://github.com/G-U-N/PyCIL)** and **[LAMDA-PILOT](https://github.com/LAMDA-CL/LAMDA-PILOT)**.
 
 ---
 
-## 仓库地址
+## License
 
-**https://github.com/xhgSh/CIDG**
+See `LICENSE` (MIT). Third-party datasets and pretrained weights remain under their respective licenses.
+
+---
+
+**Repository:** https://github.com/xhgSh/CIDG
