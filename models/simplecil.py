@@ -67,6 +67,7 @@ class Learner(BaseLearner):
         self.train_dataset = train_dataset
         self.data_manager = data_manager
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
@@ -78,11 +79,12 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
-        self._train(self.train_loader, self.test_loader, self.train_loader_for_protonet)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self._train(self.train_loader, eval_loader, self.train_loader_for_protonet)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
-    def _train(self, train_loader, test_loader, train_loader_for_protonet):
+    def _train(self, train_loader, eval_loader, train_loader_for_protonet):
 
         self._network.to(self._device)
         self.replace_fc(train_loader_for_protonet, self._network, None)

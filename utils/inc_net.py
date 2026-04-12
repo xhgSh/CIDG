@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 import torch
 from sympy import false
 from torch import nn
@@ -448,7 +449,7 @@ class Engine(BaseNet):
                 x = self.visual.attn_pool(x)
                 x = self.visual.ln_post(x)
                 pooled, tokens = self.visual._global_pool(x)
-        elif self.visual.final_ln_after_pool:
+        elif getattr(self.visual, "final_ln_after_pool", False):
             pooled, tokens = self.visual._global_pool(x)
             pooled = self.visual.ln_post(pooled)
         else:
@@ -501,8 +502,17 @@ class Engine(BaseNet):
 
     def rerank(self, des_dict, outputs, image_features_raw, class_to_label, device, topk=5):
         with torch.no_grad():
-            top5_predict = outputs.topk(topk, 1, True, True)[1]
-            top5_predict_labels = [[class_to_label[int(label)] for label in pred] for pred in top5_predict]
+            k_eff = min(topk, outputs.size(1))
+            if k_eff <= 1:
+                return outputs
+            top5_predict = outputs.topk(k_eff, 1, True, True)[1]
+            if k_eff < topk:
+                pad = top5_predict[:, :1].expand(-1, topk - k_eff)
+                top5_predict_padded = torch.cat([top5_predict, pad], dim=1)
+            else:
+                top5_predict_padded = top5_predict
+            # use only first k_eff labels per batch so text count = batch * k_eff * (k_eff-1)
+            top5_predict_labels = [[class_to_label[int(label)] for label in pred[:k_eff]] for pred in top5_predict_padded]
             logi = 0
             for _ in range(3):
                 texts = []
@@ -511,11 +521,13 @@ class Engine(BaseNet):
                         for second_label in top5_predict_labels[batch]:
                             if main_label == second_label:
                                 continue
-                            texts.append(
-                                main_label + ' with ' + random.choice(des_dict[main_label][second_label]).lower())
+                            choices = (des_dict.get(main_label) or {}).get(second_label) if des_dict else None
+                            if not choices:
+                                choices = [second_label]
+                            texts.append(main_label + " with " + random.choice(choices).lower())
                 texts = self.tokenizer(texts).to(device)
                 texts = self.model.encode_text(texts)
-                texts = texts.reshape(image_features_raw.shape[0], topk, topk - 1, -1)
+                texts = texts.reshape(image_features_raw.shape[0], k_eff, k_eff - 1, -1)
                 texts = torch.mean(texts, dim=2)
                 texts = texts / texts.norm(dim=-1, keepdim=True)
                 logits = [image_features_raw[i] @ texts[i].T for i in range(image_features_raw.shape[0])]
@@ -547,7 +559,11 @@ class CodaPromptVitNet(nn.Module):
         self.args = args
         import open_clip
         basic_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-16', pretrained='laion400m_e32')
-        basic_model.load_state_dict(torch.load('./c.pth'))
+        ckpt_path = args.get("clip_ckpt_path", "./c.pth")
+        if os.path.isfile(ckpt_path):
+            basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=False)
+        else:
+            logging.warning("CLIP checkpoint not found at %s, using open_clip ViT-B-16 laion400m_e32 only.", ckpt_path)
         state_dict = basic_model.state_dict()
         vision_width = state_dict["visual.conv1.weight"].shape[0]
         vision_layers = len(
@@ -678,8 +694,11 @@ class DualpromptVitNet(nn.Module):
         super().__init__()
         import open_clip
         basic_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-16', pretrained='laion400m_e32')
-
-        basic_model.load_state_dict(torch.load('./c.pth'))
+        ckpt_path = args.get("clip_ckpt_path", "./c.pth")
+        if os.path.isfile(ckpt_path):
+            basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=False)
+        else:
+            logging.warning("CLIP checkpoint not found at %s, using open_clip ViT-B-16 laion400m_e32 only.", ckpt_path)
         state_dict = basic_model.state_dict()
         vision_width = state_dict["visual.conv1.weight"].shape[0]
         vision_layers = len(
@@ -733,10 +752,17 @@ class DualpromptVitNet(nn.Module):
         return x
 
 
-def getbackbone():
+def getbackbone(ckpt_path=None):
     import open_clip
+    import os
+    import logging
+    if ckpt_path is None:
+        ckpt_path = "./c.pth"
     basic_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-16', pretrained='laion400m_e32')
-    basic_model.load_state_dict(torch.load('./c.pth'))
+    if os.path.isfile(ckpt_path):
+        basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=False)
+    else:
+        logging.warning("Memo: clip checkpoint not found at %s, using open_clip ViT-B-16 laion400m_e32 only.", ckpt_path)
     state_dict = basic_model.state_dict()
     vision_width = state_dict["visual.conv1.weight"].shape[0]
     vision_layers = len(
@@ -783,7 +809,8 @@ def getbackbone():
 class AdaptiveNet(nn.Module):
     def __init__(self, args, pretrained):
         super(AdaptiveNet, self).__init__()
-        self.TaskAgnosticExtractor, _ = getbackbone()
+        ckpt_path = args.get("clip_ckpt_path", "./c.pth") if isinstance(args, dict) else getattr(args, "clip_ckpt_path", "./c.pth")
+        self.TaskAgnosticExtractor, _ = getbackbone(ckpt_path)
         self.TaskAgnosticExtractor.train()
         self.AdaptiveExtractors = nn.ModuleList()
         self.pretrained = pretrained
@@ -995,10 +1022,16 @@ class IncrementalNet(BaseNet):
         return fc
 
     def forward(self, x):
-        x = self.model(x)
-        out = self.fc(x[0])
-       # out = self.fc(x["features"])
-        out["features"] = x[0]
+        # CLIP backbone expects (image, text); for image-only (e.g. finetune/DG) use encode_image
+        if hasattr(self.model, "encode_image"):
+            feats = self.model.encode_image(x)
+            if isinstance(feats, (list, tuple)):
+                feats = feats[0]
+        else:
+            x_out = self.model(x)
+            feats = x_out[0] if isinstance(x_out, (list, tuple)) else x_out
+        out = self.fc(feats)
+        out["features"] = feats
         # out.update(x)
         if hasattr(self, "gradcam") and self.gradcam:
             out["gradcam_gradients"] = self._gradcam_gradients
@@ -1329,10 +1362,11 @@ class MgclipNet(nn.Module):
         self.classes_names = None
         self.feature_dim = 512
 
-        # lora_clip
+        # lora_clip: prefer clip_ckpt_path if it exists (file path), else model_names
         from backbone.loraclip import lora_clip
+        model_path_or_name = args.get("clip_ckpt_path") if os.path.isfile(args.get("clip_ckpt_path", "")) else args["model_names"]
         self.model, self.transforms = lora_clip.load(
-            args["model_names"],
+            model_path_or_name,
             device=self.device,
             jit=jit,
             r=args["lora_rank"],
@@ -1552,9 +1586,13 @@ class BofaAdapter(BaseNet):
             [vecs_norm[labels == i].mean(dim=0, keepdim=True) for i in range(known_classes, total_classes)], dim=0)
         center_vecs_norm = torch.cat([vecs_norm[labels == i] - mu_norm[i - known_classes]
                                       for i in range(known_classes, total_classes)], dim=0)
-        cov_inv = center_vecs_norm.shape[1] * torch.linalg.pinv(
-            (center_vecs_norm.shape[0] - 1) * center_vecs_norm.T.cov() + center_vecs_norm.T.cov().trace() * torch.eye(
-                center_vecs_norm.shape[1]).cuda())
+        # CIDG/small task: add minimal ridge when N is small to avoid singular cov_inv; avoid large d_dim/n_curr which over-regularizes and kills GDA discrimination
+        n_curr = center_vecs_norm.shape[0]
+        d_dim = center_vecs_norm.shape[1]
+        cov_nd = (center_vecs_norm.shape[0] - 1) * center_vecs_norm.T.cov()
+        trace_i = center_vecs_norm.T.cov().trace() * torch.eye(d_dim, device=device)
+        ridge = 1e-2 * torch.eye(d_dim, device=device)
+        cov_inv = center_vecs_norm.shape[1] * torch.linalg.pinv(cov_nd + trace_i + ridge)
         current_ps = torch.ones(mu_norm.shape[0]).cuda() * 1. / mu_norm.shape[0]
         self.current_W = torch.einsum('nd, dc -> cn', mu_norm, cov_inv)
         self.current_b = current_ps.log() - torch.einsum('nd, dc, nc -> n', mu_norm, cov_inv, mu_norm) / 2
@@ -1628,6 +1666,11 @@ class BofaAdapter(BaseNet):
             self.olf_layer.train(training_state)
         return new_center
 
+    def get_cls_center_stage2(self):
+        """Class centers in OLF Stage 2 space (W0+B@A.T)，与 encode_image(..., stage2=True) 的特征同空间。"""
+        with torch.no_grad():
+            return self.olf_layer(self.mu, stage2=True)
+
     def get_param_group(self):
         param_groups = []
         param_groups.append({'params': self.olf_layer.get_trainable_parameters()})
@@ -1656,7 +1699,11 @@ class EaseNet(nn.Module):
         self._device = args["device"][0]
         import open_clip
         basic_model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained='laion400m_e32')
-        basic_model.load_state_dict(torch.load("./c.pth", map_location="cpu"))
+        ckpt_path = args.get("clip_ckpt_path", "./c.pth")
+        if os.path.isfile(ckpt_path):
+            basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=False)
+        else:
+            logging.warning("CLIP checkpoint not found at %s, using open_clip ViT-B-16 laion400m_e32 only.", ckpt_path)
         sd = basic_model.state_dict()
 
         vision_width = sd["visual.conv1.weight"].shape[0]
@@ -1727,8 +1774,10 @@ class EaseNet(nn.Module):
             self.backbone.add_adapter_to_list()
 
         # proxy_fc
+        # base-0 设置下 init_cls 可能为 0，此时首个 task 应该输出 inc 个类别，否则 logits 维度为 0 会导致 CE 中 t>=0 && t<n_classes 断言失败
         if self._cur_task == 0:
-            self.proxy_fc = self.generate_fc(self.out_dim, self.init_cls).to(self._device)
+            first_task_classes = self.init_cls if self.init_cls > 0 else self.inc
+            self.proxy_fc = self.generate_fc(self.out_dim, first_task_classes).to(self._device)
         else:
             self.proxy_fc = self.generate_fc(self.out_dim, self.inc).to(self._device)
 
@@ -1796,7 +1845,11 @@ class TUNANet(nn.Module):
 
         import open_clip
         basic_model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained='laion400m_e32')
-        basic_model.load_state_dict(torch.load(".p/c.pth", map_location="cpu"))
+        ckpt_path = args.get("clip_ckpt_path", "./c.pth")
+        if os.path.isfile(ckpt_path):
+            basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=False)
+        else:
+            logging.warning("CLIP checkpoint not found at %s, using open_clip ViT-B-16 laion400m_e32 only.", ckpt_path)
         sd = basic_model.state_dict()
 
         vision_width = sd["visual.conv1.weight"].shape[0]
@@ -1926,9 +1979,11 @@ class AdapterVitNet(BaseNet):
         self._device = args["device"][0]
         import open_clip
         basic_model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained='laion400m_e32')
-
         ckpt_path = args.get("clip_ckpt_path", "./c.pth")
-        basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=True)
+        if os.path.isfile(ckpt_path):
+            basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=True)
+        else:
+            logging.warning("CLIP checkpoint not found at %s, using open_clip ViT-B-16 laion400m_e32 only.", ckpt_path)
         sd = basic_model.state_dict()
 
         vision_width = sd["visual.conv1.weight"].shape[0]  # 768
@@ -2048,7 +2103,10 @@ class SSFVitNet(BaseNet):
         basic_model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained='laion400m_e32')
 
         ckpt_path = args.get("clip_ckpt_path", "./c.pth")
-        basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=True)
+        if os.path.isfile(ckpt_path):
+            basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=True)
+        else:
+            logging.warning("CLIP checkpoint not found at %s, using open_clip ViT-B-16 laion400m_e32 only.", ckpt_path)
         sd = basic_model.state_dict()
 
 
@@ -2139,7 +2197,10 @@ class VPTVitNet(BaseNet):
         basic_model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained='laion400m_e32')
 
         ckpt_path = args.get("clip_ckpt_path", "./c.pth")
-        basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=True)
+        if os.path.isfile(ckpt_path):
+            basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=True)
+        else:
+            logging.warning("CLIP checkpoint not found at %s, using open_clip ViT-B-16 laion400m_e32 only.", ckpt_path)
         sd = basic_model.state_dict()
 
         vision_width = sd["visual.conv1.weight"].shape[0]  # 768
@@ -2305,9 +2366,11 @@ def get_vitbackbone(args, pretrained=False):
     _device = args["device"][0]
     import open_clip
     basic_model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained='laion400m_e32')
-
     ckpt_path = args.get("clip_ckpt_path", "./c.pth")
-    basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=True)
+    if os.path.isfile(ckpt_path):
+        basic_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=True)
+    else:
+        logging.warning("CLIP checkpoint not found at %s, using open_clip ViT-B-16 laion400m_e32 only.", ckpt_path)
     sd = basic_model.state_dict()
 
     vision_width = sd["visual.conv1.weight"].shape[0]  # 768
@@ -2429,5 +2492,9 @@ class MultiBranchCosineIncrementalNet(BaseNet):
         self.backbones.append(tuned_model.backbone)  # adappted tuned model
 
         self._feature_dim = self.backbones[0].output_dim * len(self.backbones)
-        self.fc = self.generate_fc(self._feature_dim, self.args['init_cls'])
+        # Use current number of classes from tuned model (e.g. init_cls=0 + increment), not init_cls only
+        nb_classes = getattr(tuned_model.fc, "out_features", self.args.get("init_cls", 0))
+        if nb_classes <= 0:
+            nb_classes = self.args.get("init_cls", 0) + self.args.get("increment", 10)
+        self.fc = self.generate_fc(self._feature_dim, nb_classes)
 

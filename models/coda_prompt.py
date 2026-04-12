@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 import torch
+from copy import deepcopy
 from torch import nn
 from tqdm import tqdm
 from torch import optim
@@ -60,6 +61,7 @@ class Learner(BaseLearner):
         self.data_manager = data_manager
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, drop_last=True,
                                        num_workers=num_workers)
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, drop_last=False,
                                       num_workers=num_workers)
@@ -67,19 +69,20 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
-        self._train(self.train_loader, self.test_loader)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self._train(self.train_loader, eval_loader)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
         self.build_rehearsal_memory(data_manager, self.samples_per_class)
 
-    def _train(self, train_loader, test_loader):
+    def _train(self, train_loader, eval_loader):
         self._network.to(self._device)
 
         optimizer = self.get_optimizer()
         scheduler = self.get_scheduler(optimizer)
 
         self.data_weighting()
-        self._init_train(train_loader, test_loader, optimizer, scheduler)
+        self._init_train(train_loader, eval_loader, optimizer, scheduler)
 
     def data_weighting(self):
         self.dw_k = torch.tensor(np.ones(self._total_classes + 1, dtype=np.float32))
@@ -110,8 +113,11 @@ class Learner(BaseLearner):
 
         return scheduler
 
-    def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+    def _init_train(self, train_loader, eval_loader, optimizer, scheduler):
         prog_bar = tqdm(range(self.args['tuned_epoch']))
+        best_val_acc = 0.0
+        best_model_state = None
+        eval_name = "Val" if self.val_loader is not None else "Test"
         for _, epoch in enumerate(prog_bar):
             self._network.train()
 
@@ -144,15 +150,19 @@ class Learner(BaseLearner):
                 scheduler.step()
 
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            test_acc = self._compute_accuracy(self._network, test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+            eval_acc = self._compute_accuracy(self._network, eval_loader)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, {}_accy {:.2f}".format(
                 self._cur_task,
                 epoch + 1,
                 self.args['tuned_epoch'],
                 losses / len(train_loader),
                 train_acc,
-                test_acc,
+                eval_name,
+                eval_acc,
             )
+            if eval_acc > best_val_acc:
+                best_val_acc = eval_acc
+                best_model_state = deepcopy(self._network.module.state_dict() if isinstance(self._network, nn.DataParallel) else self._network.state_dict())
 
             # if (epoch + 1) % 5 == 0:
             #
@@ -166,6 +176,9 @@ class Learner(BaseLearner):
             #     )
             prog_bar.set_description(info)
 
+        if best_model_state is not None:
+            (self._network.module if isinstance(self._network, nn.DataParallel) else self._network).load_state_dict(best_model_state)
+            logging.info("Task {}: Restored best checkpoint with {}_acc {:.2f}%".format(self._cur_task, eval_name, best_val_acc))
         logging.info(info)
 
     def _eval_cnn(self, loader):
@@ -175,11 +188,11 @@ class Learner(BaseLearner):
             inputs = inputs.to(self._device)
             with torch.no_grad():
                 outputs = self._network(inputs)[:, :self._total_classes]
-            predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+            k_eff = min(self.topk, outputs.size(1))
+            predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
@@ -197,6 +210,28 @@ class Learner(BaseLearner):
             total += len(targets)
 
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+
+    def _get_eval_logits_for_fusion(self):
+        """
+        为 BaseLearner.eval_task 的 logits 融合提供专用接口（CodaPrompt 专用）。
+        注意：这里必须与本类自定义的 _eval_cnn 使用完全一致的前向路径
+        （self._network(inputs)[:, :self._total_classes]），
+        否则 BaseLearner 中默认的 self._network(inputs)["logits"] 会报
+        “too many indices for tensor of dimension 2”，并导致融合直接失败。
+        """
+        self._network.eval()
+        logits_list, targets_list = [], []
+        for _, (_, inputs, targets) in enumerate(self.test_loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                outputs = self._network(inputs)[:, :self._total_classes]
+            logits_list.append(outputs.cpu().numpy())
+            targets_list.append(targets.cpu().numpy())
+
+        import numpy as _np
+        cil_logits = _np.concatenate(logits_list, axis=0)
+        cil_targets = _np.concatenate(targets_list, axis=0)
+        return cil_logits, cil_targets
 
 
 class _LRScheduler(object):

@@ -73,6 +73,7 @@ class Learner(BaseLearner):
             num_workers=num_workers
         )
 
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(
             np.arange(0, self._total_classes),
             source='test',
@@ -85,7 +86,8 @@ class Learner(BaseLearner):
             num_workers=num_workers
         )
 
-        self._train(self.train_loader, self.test_loader)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self._train(self.train_loader, eval_loader)
         self.build_rehearsal_memory(data_manager, self.samples_per_class)
      
 
@@ -106,7 +108,7 @@ class Learner(BaseLearner):
                     self._network.AdaptiveExtractors[i].eval()
 
 
-    def _train(self, train_loader, test_loader):
+    def _train(self, train_loader, eval_loader):
         self._network.to(self._device)
         if self._cur_task == 0:
             optimizer = optim.SGD(
@@ -130,7 +132,7 @@ class Learner(BaseLearner):
                 raise NotImplementedError
 
             if not self.args['skip']:
-                self._init_train(train_loader, test_loader, optimizer, scheduler)
+                self._init_train(train_loader, eval_loader, optimizer, scheduler)
             else:
                 if isinstance(self._network, nn.DataParallel):
                     self._network = self._network.module
@@ -160,10 +162,13 @@ class Learner(BaseLearner):
                 )
             else:
                 raise NotImplementedError
-            self._update_representation(train_loader, test_loader, optimizer, scheduler)
+            self._update_representation(train_loader, eval_loader, optimizer, scheduler)
 
-    def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+    def _init_train(self, train_loader, eval_loader, optimizer, scheduler):
         prog_bar = tqdm(range(self.args["init_epoch"]))
+        best_val_acc = 0.0
+        best_model_state = None
+        eval_name = "Val" if self.val_loader is not None else "Test"
         for _, epoch in enumerate(prog_bar):
             self._network.train()
             losses = 0.
@@ -184,18 +189,22 @@ class Learner(BaseLearner):
 
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            test_acc = self._compute_accuracy(self._network, test_loader)
-            info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
-                self._cur_task, epoch + 1, self.args['init_epoch'], losses / len(train_loader), train_acc, test_acc)
-            # if epoch % 5 == 0:
-            #
-            # else:
-            #     info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}'.format(
-            #         self._cur_task, epoch + 1, self.args['init_epoch'], losses / len(train_loader), train_acc)
+            eval_acc = self._compute_accuracy(self._network, eval_loader)
+            info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, {}_accy {:.2f}'.format(
+                self._cur_task, epoch + 1, self.args['init_epoch'], losses / len(train_loader), train_acc, eval_name, eval_acc)
             prog_bar.set_description(info)
+            if eval_acc > best_val_acc:
+                best_val_acc = eval_acc
+                best_model_state = copy.deepcopy(self._network.module.state_dict() if isinstance(self._network, nn.DataParallel) else self._network.state_dict())
+        if best_model_state is not None:
+            (self._network.module if isinstance(self._network, nn.DataParallel) else self._network).load_state_dict(best_model_state)
+            logging.info("Task {}: Restored best checkpoint with {}_acc {:.2f}%".format(self._cur_task, eval_name, best_val_acc))
         logging.info(info)
 
-    def _update_representation(self, train_loader, test_loader, optimizer, scheduler):
+    def _update_representation(self, train_loader, eval_loader, optimizer, scheduler):
+        # Reset best checkpoint for this task so we only load state_dict from current model structure
+        self._best_val_acc_memo = 0.0
+        self._best_model_state_memo = None
         prog_bar = tqdm(range(self.args["epochs"]))
         for _, epoch in enumerate(prog_bar):
             self.set_network()
@@ -228,17 +237,18 @@ class Learner(BaseLearner):
 
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            test_acc = self._compute_accuracy(self._network, test_loader)
-            info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_aux  {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
+            eval_acc = self._compute_accuracy(self._network, eval_loader)
+            eval_name = "Val" if self.val_loader is not None else "Test"
+            info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_aux  {:.3f}, Train_accy {:.2f}, {}_accy {:.2f}'.format(
                 self._cur_task, epoch + 1, self.args["epochs"], losses / len(train_loader),
-                                losses_clf / len(train_loader), losses_aux / len(train_loader), train_acc, test_acc)
-            # if epoch % 5 == 0:
-            #
-            # else:
-            #     info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_aux {:.3f}, Train_accy {:.2f}'.format(
-            #         self._cur_task, epoch + 1, self.args["epochs"], losses / len(train_loader),
-            #                         losses_clf / len(train_loader), losses_aux / len(train_loader), train_acc)
+                                losses_clf / len(train_loader), losses_aux / len(train_loader), train_acc, eval_name, eval_acc)
             prog_bar.set_description(info)
+            if eval_acc > self._best_val_acc_memo:
+                self._best_val_acc_memo = eval_acc
+                self._best_model_state_memo = copy.deepcopy(self._network.module.state_dict() if isinstance(self._network, nn.DataParallel) else self._network.state_dict())
+        if getattr(self, "_best_model_state_memo", None) is not None:
+            (self._network.module if isinstance(self._network, nn.DataParallel) else self._network).load_state_dict(self._best_model_state_memo)
+            logging.info("Task {}: Restored best checkpoint with {}_acc {:.2f}%".format(self._cur_task, eval_name, self._best_val_acc_memo))
         logging.info(info)
 
 

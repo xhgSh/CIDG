@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from utils.inc_net import MultiBranchCosineIncrementalNet,AdapterVitNet
 from models.base import BaseLearner
 from utils.toolkit import target2onehot, tensor2numpy
+from copy import deepcopy
 
 # tune the model at first session with adapter, and then conduct simplecil.
 num_workers = 8
@@ -67,7 +68,8 @@ class Learner(BaseLearner):
         self.train_dataset=train_dataset
         self.data_manager=data_manager
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
-
+        # CIDG: use val (source validation) for training-time evaluation, test (held-out domain) only for final eval
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test" )
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
@@ -77,11 +79,13 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
-        self._train(self.train_loader, self.test_loader, self.train_loader_for_protonet)
+        # Use val_loader if available (CIDG), otherwise fallback to test_loader
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self._train(self.train_loader, eval_loader, self.train_loader_for_protonet)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
-    def _train(self, train_loader, test_loader, train_loader_for_protonet):
+    def _train(self, train_loader, eval_loader, train_loader_for_protonet):
         
         self._network.to(self._device)
         
@@ -101,7 +105,7 @@ class Learner(BaseLearner):
             elif self.args['optimizer']=='adam':
                 optimizer=optim.AdamW(self._network.parameters(), lr=self.init_lr, weight_decay=self.weight_decay)
             scheduler=optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args['tuned_epoch'], eta_min=self.min_lr)
-            self._init_train(train_loader, test_loader, optimizer, scheduler)
+            self._init_train(train_loader, eval_loader, optimizer, scheduler)
             self.construct_dual_branch_network()
         else:
             pass
@@ -113,8 +117,11 @@ class Learner(BaseLearner):
         network.construct_dual_branch_network(self._network)
         self._network=network.to(self._device)
 
-    def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+    def _init_train(self, train_loader, eval_loader, optimizer, scheduler):
         prog_bar = tqdm(range(self.args['tuned_epoch']))
+        best_val_acc = 0.0
+        best_model_state = None
+        eval_name = "Val" if self.val_loader is not None else "Test"
         for _, epoch in enumerate(prog_bar):
             self._network.train()
             losses = 0.0
@@ -136,16 +143,33 @@ class Learner(BaseLearner):
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-            test_acc = self._compute_accuracy(self._network, test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+            eval_acc = self._compute_accuracy(self._network, eval_loader)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, {}_accy {:.2f}".format(
                 self._cur_task,
                 epoch + 1,
                 self.args['tuned_epoch'],
                 losses / len(train_loader),
                 train_acc,
-                test_acc,
+                eval_name,
+                eval_acc,
             )
             prog_bar.set_description(info)
+            
+            # Save best checkpoint based on val acc
+            if eval_acc > best_val_acc:
+                best_val_acc = eval_acc
+                if isinstance(self._network, nn.DataParallel):
+                    best_model_state = deepcopy(self._network.module.state_dict())
+                else:
+                    best_model_state = deepcopy(self._network.state_dict())
+        
+        # Restore best model
+        if best_model_state is not None:
+            if isinstance(self._network, nn.DataParallel):
+                self._network.module.load_state_dict(best_model_state)
+            else:
+                self._network.load_state_dict(best_model_state)
+            logging.info("Task {}: Restored best checkpoint with {}_acc {:.2f}%".format(self._cur_task, eval_name, best_val_acc))
 
         logging.info(info)
 

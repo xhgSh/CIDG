@@ -43,6 +43,7 @@ class Learner(BaseLearner):
         self.train_dataset = train_dataset
         self.data_manager = data_manager
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
@@ -114,15 +115,59 @@ class Learner(BaseLearner):
                 image_features = self._network.convnet.encode_image(inputs)
                 image_features /= image_features.norm(dim=-1, keepdim=True)
                 outputs = image_features @ text_features.T
-            predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+            k_eff = min(self.topk, outputs.size(1))
+            predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+
+    def get_zs_predictions_and_logits(self):
+        """
+        对当前 test_loader 做 CLIP zero-shot 预测，返回与 loader 顺序一致的预测和 logits。
+        供 runner 保存到 zs_result 目录，供其他模型门控时加载。
+        返回: y_pred [N, topk], y_true [N], logits [N, C]
+        """
+        self._network.eval()
+        class_to_label = self.data_manager._class_to_label
+        templates = self.data_manager._data_to_prompt
+        total_labels = class_to_label[: self._total_classes]
+        text_features = []
+        with torch.no_grad():
+            for l in total_labels:
+                texts = [t.format(l) for t in templates]
+                texts = self._network.tokenizer(texts).to(self._device)
+                class_embeddings = self._network.convnet.encode_text(texts)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                class_embeddings = class_embeddings.mean(dim=0)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                text_features.append(class_embeddings)
+            text_features = torch.stack(text_features, dim=0)
+
+        y_pred, y_true = [], []
+        logits_list = []
+        for _, (_, inputs, targets) in enumerate(self.test_loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                image_features = self._network.convnet.encode_image(inputs)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                outputs = image_features @ text_features.T
+            k_eff = min(self.topk, outputs.size(1))
+            predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
+            y_pred.append(predicts.cpu().numpy())
+            y_true.append(targets.cpu().numpy())
+            logits_list.append(outputs.cpu().numpy())
+
+        y_pred = np.concatenate(y_pred, axis=0)
+        y_true = np.concatenate(y_true, axis=0)
+        logits = np.concatenate(logits_list, axis=0)
+        return y_pred, y_true, logits
 
     def _eval_zero_shot(self):
         self._network.eval()
@@ -154,7 +199,11 @@ class Learner(BaseLearner):
                 image_features = self._network.convnet.encode_image(inputs)
                 image_features /= image_features.norm(dim=-1, keepdim=True)
                 outputs = image_features @ text_features.T
-            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]
+            k_eff = min(self.topk, outputs.size(1))
+            predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
             logits.append(outputs.cpu().numpy())

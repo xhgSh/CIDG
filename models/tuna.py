@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 import torch
+from copy import deepcopy
 from torch import nn
 from tqdm import tqdm
 from torch import optim
@@ -107,6 +108,7 @@ class Learner(BaseLearner):
         self.data_manager = data_manager
         self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,
                                        num_workers=num_workers)
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
@@ -119,19 +121,20 @@ class Learner(BaseLearner):
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
 
-        self._train(self.train_loader, self.test_loader)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self._train(self.train_loader, eval_loader)
         #  self.replace_fc()
 
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
-    def _train(self, train_loader, test_loader):
+    def _train(self, train_loader, eval_loader):
         self._network.backbone.to(self._device)
         self._network.fc.to(self._device)
         optimizer = self.get_optimizer(self._network.backbone)
         scheduler = self.get_scheduler(optimizer)
 
-        self._init_train(train_loader, test_loader, optimizer, scheduler)
+        self._init_train(train_loader, eval_loader, optimizer, scheduler)
         self._network.backbone.adapter_update()
         if self._cur_task > 0:
             self._network.backbone.merge()
@@ -175,9 +178,12 @@ class Learner(BaseLearner):
 
         return scheduler
 
-    def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+    def _init_train(self, train_loader, eval_loader, optimizer, scheduler):
         prog_bar = tqdm(range(self.args['tuned_epoch']))
         loss_cos = AngularPenaltySMLoss(loss_type='cosface', eps=1e-7, s=self.args["scale"], m=self.args["m"])
+        best_val_acc = 0.0
+        best_model_state = None
+        eval_name = "Val" if self.val_loader is not None else "Test"
         for _, epoch in enumerate(prog_bar):
             self._network.backbone.train()
             losses = 0.0
@@ -204,16 +210,24 @@ class Learner(BaseLearner):
             if scheduler:
                 scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+            eval_acc = self._compute_accuracy(self._network, eval_loader)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, {}_accy {:.2f}".format(
                 self._cur_task,
                 epoch + 1,
                 self.args['tuned_epoch'],
                 losses / len(train_loader),
                 train_acc,
+                eval_name,
+                eval_acc,
             )
             prog_bar.set_description(info)
+            if eval_acc > best_val_acc:
+                best_val_acc = eval_acc
+                best_model_state = deepcopy(self._network.module.state_dict() if isinstance(self._network, nn.DataParallel) else self._network.state_dict())
 
+        if best_model_state is not None:
+            (self._network.module if isinstance(self._network, nn.DataParallel) else self._network).load_state_dict(best_model_state)
+            logging.info("Task {}: Restored best checkpoint with {}_acc {:.2f}%".format(self._cur_task, eval_name, best_val_acc))
         logging.info(info)
 
     def orth_loss(self, features):
@@ -365,11 +379,11 @@ class Learner(BaseLearner):
                 features = self._network.backbone(inputs, adapter_id=0, train=False)["features"]
                 logits = self._network.fc(features)["logits"][:, :self._total_classes]
 
-            predicts = torch.topk(
-                logits, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+            k_eff = min(self.topk, logits.size(1))
+            predicts = torch.topk(logits, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
@@ -394,9 +408,11 @@ class Learner(BaseLearner):
                     logits = self._network.fc(features)["logits"][:, :self._total_classes] * self.args['scale']
                 probs = F.softmax(logits, dim=1)
                 entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=1)  # bs
-                predicts = torch.topk(
-                    logits, k=self.topk, dim=1, largest=True, sorted=True
-                )[1]
+                k_eff = min(self.topk, logits.size(1))
+                predicts = torch.topk(logits, k=k_eff, dim=1, largest=True, sorted=True)[1]
+                if k_eff < self.topk:
+                    pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                    predicts = torch.cat([predicts, pad], dim=1)
                 all_predicts.append(predicts.cpu().numpy())
                 all_entropies.append(entropy.cpu().numpy())
                 all_logits.append(logits.cpu().numpy())
@@ -414,7 +430,11 @@ class Learner(BaseLearner):
             min_entropy_logits = F.softmax(min_entropy_logits, dim=1)
 
             outputs = logits + min_entropy_logits
-            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]
+            k_eff = min(self.topk, outputs.size(1))
+            predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             pred_specific = torch.max(min_entropy_logits, dim=1)[1]
             pred_general = torch.max(logits, dim=1)[1]
             y_pred.append(predicts.cpu().numpy())

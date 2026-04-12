@@ -1,6 +1,10 @@
+import os
 import numpy as np
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
+
+# 整体数据集根目录，每个数据集在其下有一级子目录，如 /root/autodl-tmp/cifar224/train/
+DATA_ROOT = "/root/autodl-tmp"
 
 
 class iData(object):
@@ -12,6 +16,7 @@ class iData(object):
 
 class iCIFAR10(iData):
     use_path = False
+    folder_name = "cifar10"
     train_trsf = [
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -28,8 +33,9 @@ class iCIFAR10(iData):
     class_order = np.arange(10).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR10("./data", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR10("./data", train=False, download=True)
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dataset = datasets.cifar.CIFAR10(root, train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR10(root, train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )
@@ -66,6 +72,7 @@ class iCIFAR10(iData):
 #         )
 class iCIFAR100(iData):
     use_path = False
+    folder_name = "cifar100"
     # Clip preprocess transforms
     train_trsf = [
         transforms.Resize(size=224,interpolation=3),
@@ -75,10 +82,9 @@ class iCIFAR100(iData):
     ]
     test_trsf = train_trsf
     def download_data(self,preprocess=None):
-       # trainset = datasets.CIFAR100(root='"./data"', train=True, download=True)
-       # testset = datasets.CIFAR100(root='"./data"', train=False, download=True)
-        trainset = datasets.CIFAR100(root="[DATA-PATH]/train/", train=True, download=False)
-        testset = datasets.CIFAR100(root="[DATA-PATH]/val/", train=False, download=False)
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        trainset = datasets.CIFAR100(root=os.path.join(root, "train"), train=True, download=False)
+        testset = datasets.CIFAR100(root=os.path.join(root, "val"), train=False, download=False)
         self.train_data, self.train_targets = trainset.data, np.array(trainset.targets)
         self.test_data, self.test_targets = testset.data, np.array(testset.targets)
 
@@ -119,6 +125,7 @@ def build_transform(is_train, args):
 
 class iCIFAR224(iData):
     use_path = False
+    folder_name = "cifar224"
 
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
@@ -126,17 +133,35 @@ class iCIFAR224(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100("[DATA-PATH]/train/", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR100("[DATA-PATH]/val/", train=False, download=True)
-        self.train_data, self.train_targets = train_dataset.data, np.array(
-            train_dataset.targets
-        )
-        self.test_data, self.test_targets = test_dataset.data, np.array(
-            test_dataset.targets
-        )
+        """
+        CIFAR-100 @ 224x224 for CLIP.
+        这里不再自动下载，而是假定数据已经手动放好：
+        - 训练：/root/autodl-tmp/cifar224/train/cifar-100-python/...
+        - 测试：/root/autodl-tmp/cifar224/val/cifar-100-python/...
+
+        如果路径下没有数据，会抛出清晰的错误提示。
+        """
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_root = os.path.join(root, "train")
+        val_root = os.path.join(root, "val")
+        try:
+            train_dataset = datasets.cifar.CIFAR100(train_root, train=True, download=False)
+            test_dataset = datasets.cifar.CIFAR100(val_root, train=False, download=False)
+        except RuntimeError as e:
+            raise RuntimeError(
+                "CIFAR-100 data not found under {}\n"
+                "请手动下载官方文件 cifar-100-python.tar.gz 并解压到：\n"
+                "  训练集: {train_root}/cifar-100-python\n"
+                "  测试集: {val_root}/cifar-100-python\n"
+                "下载地址: https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz\n"
+                "原始错误: {}".format(root, train_root=train_root, val_root=val_root, e=str(e))
+            )
+        self.train_data, self.train_targets = train_dataset.data, np.array(train_dataset.targets)
+        self.test_data, self.test_targets = test_dataset.data, np.array(test_dataset.targets)
 
 class iImageNet1000(iData):
     use_path = True
+    folder_name = "imagenet1000"
     train_trsf = [
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
@@ -154,19 +179,18 @@ class iImageNet1000(iData):
     class_order = np.arange(1000).tolist()
 
     def download_data(self):
-        assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 
 class iImageNet100(iData):
     use_path = True
+    folder_name = "imagenet100"
     train_trsf = [
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
@@ -183,45 +207,38 @@ class iImageNet100(iData):
     class_order = np.arange(1000).tolist()
 
     def download_data(self):
-        assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 
 class iImageNetR(iData):
     use_path = True
-    
+    folder_name = "imagenetr"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [    ]
 
-
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-        # print(test_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 
 class iImageNetA(iData):
     use_path = True
-    
+    folder_name = "imageneta"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [    ]
@@ -229,23 +246,19 @@ class iImageNetA(iData):
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir ="[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-        # print(test_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 
 class objectnet(iData):
     use_path = True
-    
+    folder_name = "objectnet"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [    ]
@@ -253,22 +266,19 @@ class objectnet(iData):
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir ="[DATA-PATH]/train/"
-        test_dir ="[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 
 class CUB(iData):
     use_path = True
-    
+    folder_name = "cub200"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [    ]
@@ -276,21 +286,18 @@ class CUB(iData):
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir ="[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 class Caltech101(iData):
     use_path = True
-    
+    folder_name = "caltech101"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [  ]
@@ -298,21 +305,18 @@ class Caltech101(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir ="[DATA-PATH]/train/"
-        test_dir ="[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 class Food101(iData):
     use_path = True
-    
+    folder_name = "food101"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [  ]
@@ -320,21 +324,18 @@ class Food101(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir ="[DATA-PATH]/train/"
-        test_dir ="[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 class Flowers(iData):
     use_path = True
-    
+    folder_name = "flowers"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [  ]
@@ -342,21 +343,18 @@ class Flowers(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir ="[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 class Aircraft(iData):
     use_path = True
-    
+    folder_name = "aircraft"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [  ]
@@ -364,21 +362,18 @@ class Aircraft(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 class UCF101(iData):
     use_path = True
-    
+    folder_name = "ucf101"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [  ]
@@ -386,21 +381,18 @@ class UCF101(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir ="[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 class StanfordCars(iData):
     use_path = True
-    
+    folder_name = "cars"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [  ]
@@ -408,22 +400,19 @@ class StanfordCars(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir ="[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 
 class TV100(iData):
     use_path = True
-    
+    folder_name = "tv100"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [  ]
@@ -431,21 +420,18 @@ class TV100(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir ="[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 class SUN(iData):
     use_path = True
-    
+    folder_name = "sun"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [  ]
@@ -453,21 +439,18 @@ class SUN(iData):
     class_order = np.arange(300).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir =" [DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 class omnibenchmark(iData):
     use_path = True
-    
+    folder_name = "omnibenchmark"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [    ]
@@ -475,19 +458,17 @@ class omnibenchmark(iData):
     class_order = np.arange(300).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
 
 class vtab(iData):
     use_path = True
-    
+    folder_name = "vtab"
     train_trsf=build_transform(True, None)
     test_trsf=build_transform(False, None)
     common_trsf = [    ]
@@ -495,16 +476,13 @@ class vtab(iData):
     class_order = np.arange(50).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/val/"
-
+        root = os.path.join(DATA_ROOT, self.folder_name)
+        train_dir = os.path.join(root, "train")
+        test_dir = os.path.join(root, "val")
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
-
         print(train_dset.class_to_idx)
         print(test_dset.class_to_idx)
-
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
    

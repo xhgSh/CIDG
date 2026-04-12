@@ -2,6 +2,7 @@ import logging
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from tqdm import tqdm
 from torch import optim
 from torch.utils.data import DataLoader
@@ -30,7 +31,8 @@ class Learner(BaseLearner):
         self.min_lr = get_attribute(args, "min_lr", 1e-8)
         self.frozen_layers = get_attribute(args, "frozen_layers", None)
         self.tuned_epoch = get_attribute(args, "tuned_epoch", 5)
-        self.stage2_epoch = get_attribute(args, "epoch", 2)
+        # 默认 0：Stage 2 在 CIDG 下易致 Train_acc 归零、测试崩盘；需 Stage 2 时在 exps 中显式设 "epoch": 2
+        self.stage2_epoch = get_attribute(args, "epoch", 0)
         self._known_classes = 0
         self.prototype = []
         self.loss_type = get_attribute(args, "loss_type", "CE")
@@ -73,6 +75,7 @@ class Learner(BaseLearner):
         cur_label2task = [self._cur_task] * (self._total_classes - self._known_classes)
         self.label2task = self.label2task + cur_label2task
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
         self.test_loader_task = DataLoader(test_dataset_task, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
@@ -83,10 +86,13 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
         self._network.update_stat(self._known_classes, self._total_classes, self.train_loader, self._device)
-        self.init_accuracy(self.train_loader, self.test_loader_task, self.test_loader)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self.init_accuracy(self.train_loader, self.test_loader_task, eval_loader)
         # self._network.update_task(self._total_classes - self._known_classes)
         self._network.start_train(self._total_classes - self._known_classes)
-        self.train(self.train_loader, self.test_loader, train_dataset)
+        self.train(self.train_loader, eval_loader, train_dataset)
+        # stage2_epoch==0 时不做 Stage 2，融合时用 W_task 而非 W0+B@A.T，避免表示空间混用导致测试崩到 0
+        self._network.olf_layer._skip_stage2_fusion = (self.stage2_epoch == 0)
         self._network.end_train()
 
     def eval_init(self, eval_loader, text_proto):
@@ -134,10 +140,14 @@ class Learner(BaseLearner):
         print(f"\n>>> best λ = {best_lam:.3f}")
         return best_lam
 
-    def init_accuracy(self, train_loader, test_new_loader, test_loader):
+    def init_accuracy(self, train_loader, test_new_loader, eval_loader):
         class_to_label = self.data_manager._class_to_label
         templates = self.data_manager._data_to_prompt[0]
-        labels = [class_to_label[y] for y in range(self.args['init_cls'] + self._cur_task * self.args['increment'])]
+        # 使用当前 task 后的总类数（与 data_manager 一致），避免 init_cls/increment 与 CIDG 设定不符导致 0 类
+        n_classes = self._total_classes
+        if n_classes <= 0:
+            raise ValueError("init_accuracy: _total_classes must be > 0, got %s" % n_classes)
+        labels = [class_to_label[y] for y in range(n_classes)]
         texts = [templates.format(inst) for inst in labels]
         texts = self._network.tokenizer(texts).to(self._device)
         self.text_proto = self._network.encode_text(texts)
@@ -146,10 +156,10 @@ class Learner(BaseLearner):
             self.t_lam = self.search_lambda_for_prompt(train_loader, image_proto, self.text_proto)
         new_proto = image_proto / image_proto.norm(dim=-1, keepdim=True) * (1 - self.t_lam) + \
             self.text_proto / self.text_proto.norm(dim=-1, keepdim=True) * self.t_lam
-        test_acc_lam = self.eval_init(test_loader, new_proto)
-        logging.info("Eval Test Loader: Zero_Shot_Lam: {:.2f}".format(test_acc_lam))
+        eval_acc_lam = self.eval_init(eval_loader, new_proto)
+        logging.info("Eval Loader: Zero_Shot_Lam: {:.2f}".format(eval_acc_lam))
 
-    def train(self, train_loader, test_loader, train_dataset):
+    def train(self, train_loader, eval_loader, train_dataset):
         self._network.to(self._device)
         param_groups = self._network.get_param_group()
         lr = self.init_lr
@@ -165,7 +175,7 @@ class Learner(BaseLearner):
         prog_bar = tqdm(range(self.tuned_epoch+self.stage2_epoch))
         templates = self.data_manager._data_to_prompt[0]
         if self._cur_task > 0:
-            old_class = list(range(self.args['init_cls'] + (self._cur_task - 1) * self.args['increment']))
+            old_class = list(range(self._known_classes))
         from utils.toolkit import ClipLoss
         cliploss = ClipLoss(img_only=True)
         text_proto = self.text_proto
@@ -186,13 +196,15 @@ class Learner(BaseLearner):
                 self.img_proto = img_proto
                 inputs = inputs.to(self._device)
                 targets = targets.to(self._device)
+                # 当前 task 的类在 [_known_classes, _total_classes)，offset 到 0 起给当前 head 用
                 if self._cur_task > 0:
-                    offset_targets = targets - self.args['init_cls'] - (self._cur_task - 1) * self.args['increment']
+                    offset_targets = targets - self._known_classes
                 else:
                     offset_targets = targets
                 logit_scale = self._network.model.logit_scale
 
-                if epoch >= self.tuned_epoch and self._cur_task > 0:
+                in_stage2 = epoch >= self.tuned_epoch and self._cur_task > 0
+                if in_stage2:
                     image_features, low_logits = self._network.encode_image(inputs, stage2=True, return_origin=False)
                 else:
                     image_features, low_logits = self._network.encode_image(inputs, return_origin=False)
@@ -201,13 +213,20 @@ class Learner(BaseLearner):
                     low_loss = nn.functional.cross_entropy(low_logits, offset_targets)
                 img_feas = image_features / image_features.norm(dim=-1, keepdim=True)
                 if self.loss_type == "CE":
+                    # Stage 2 时特征为 olf_layer(x, stage2=True) 即 W0+B@A.T 空间，必须用同空间中心，否则 logits 无效、Train_acc 归零
+                    if in_stage2:
+                        img_proto_stage2 = self._network.get_cls_center_stage2()
+                        img_proto_use = img_proto_stage2 / img_proto_stage2.norm(dim=-1, keepdim=True)
+                    else:
+                        img_proto_use = img_proto / img_proto.norm(dim=-1, keepdim=True)
                     if self.center_type == "img":
-                        cls_proto = img_proto / img_proto.norm(dim=-1, keepdim=True)
+                        cls_proto = img_proto_use
                     elif self.center_type == "text":
                         cls_proto = text_proto / text_proto.norm(dim=-1, keepdim=True)
-                    else: 
-                        cls_proto = self.t_lam * (img_proto / img_proto.norm(dim=-1, keepdim=True)) + \
+                    else:
+                        cls_proto = self.t_lam * img_proto_use + \
                             (1 - self.t_lam) * text_proto / text_proto.norm(dim=-1, keepdim=True)
+                        cls_proto = cls_proto / cls_proto.norm(dim=-1, keepdim=True)
                     logits = self._network.model.logit_scale * img_feas @ cls_proto.t()
                     clip_loss = nn.functional.cross_entropy(logits, targets)
                 else:
@@ -263,7 +282,7 @@ class Learner(BaseLearner):
         correct, correct_2, total = 0, 0, 0
         for i, (_, inputs, targets) in enumerate(loader):
             if self._cur_task > 0:
-                offset_targets = targets - self.args['init_cls'] - (self._cur_task - 1) * self.args['increment']
+                offset_targets = targets - self._known_classes
             else:
                 offset_targets = targets
             inputs = inputs.to(self._device)
@@ -323,6 +342,7 @@ class Learner(BaseLearner):
     def gda_pred(self, inputs):
         transf_image_features_raw_ = self._network.visual_forward_(inputs)
         transf_image_features_raw_ = transf_image_features_raw_ / transf_image_features_raw_.norm(dim=-1, keepdim=True)
+        # W from einsum 'nd,dc->cn' is (D, C); (B, D) @ (D, C) -> (B, C)
         outputs_gda = transf_image_features_raw_ @ self._network.W + self._network.b
         return outputs_gda
 
@@ -356,37 +376,34 @@ class Learner(BaseLearner):
         text_proto = torch.stack(text_features, dim=0)  # [C, D]
 
 
-        img_proto = self._network.get_cls_center_lora()
-        if self.center_type == "img":
-            cls_proto = img_proto / img_proto.norm(dim=-1, keepdim=True)
-        elif self.center_type == "text":
-            cls_proto = text_proto / text_proto.norm(dim=-1, keepdim=True)
-        else:
-            if self.use_up_cen:
-                cls_proto = self.t_lam * (img_proto / img_proto.norm(dim=-1, keepdim=True)) + \
-                            (1 - self.t_lam) * (text_proto / text_proto.norm(dim=-1, keepdim=True))
-            else:
-                img_proto2 = self._network.get_cls_center()
-                cls_proto = self.t_lam * (img_proto2 / img_proto2.norm(dim=-1, keepdim=True)) + \
-                            (1 - self.t_lam) * (text_proto / text_proto.norm(dim=-1, keepdim=True))
-
         y_pred, y_true = [], []
+        olf = self._network.olf_layer
+        mu = self._network.mu  # [num_classes, D_in]
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
             targets = targets.to(self._device)
 
             with torch.no_grad():
-                transf_image_features, _ = self._network.encode_image_eval(inputs)
-                transf_image_features1, _ = transf_image_features
-
-                transf_image_features1 = transf_image_features1 / transf_image_features1.norm(dim=-1, keepdim=True)
-
-                out_update = transf_image_features1 @ cls_proto.T
+                # 专家集成：对每个 task 的 W 分别算 logits 再平均，避免单一 W_fusion 平均后判别力下降导致 Task 2+ 崩盘
+                input_features = self._network.visual_forward_(inputs)  # (B, D_in)
+                logits_list = []
+                for W in olf.W_list:
+                    feats = F.linear(input_features, W)
+                    feats = feats / feats.norm(dim=-1, keepdim=True)
+                    centers = F.linear(mu, W)  # (C, D_out)，与 feats 同空间（OLF 投影空间）
+                    # OLF 路径：feats 与 centers 均在 OLF 空间；text_proto 在 CLIP 文本空间，混合会空间不一致导致 CIL/CIDG 首阶段准确率崩盘，故此处只用 img 中心
+                    proto = centers / centers.norm(dim=-1, keepdim=True)
+                    logits_list.append(feats @ proto.T)
+                out_update = torch.stack(logits_list, dim=0).mean(dim=0)
                 out_gda = self.gda_pred(inputs)
 
                 out_ens_gda_mat = self.stat * out_gda + (1 - self.stat) * out_update
-                preds = torch.topk(out_ens_gda_mat, k=self.topk, dim=1, largest=True, sorted=True)[1]  # [bs, topk]
+                k_eff = min(self.topk, out_ens_gda_mat.size(1))
+                preds = torch.topk(out_ens_gda_mat, k=k_eff, dim=1, largest=True, sorted=True)[1]
+                if k_eff < self.topk:
+                    pad = preds[:, :1].expand(-1, self.topk - k_eff)
+                    preds = torch.cat([preds, pad], dim=1)
 
             y_pred.append(preds.cpu().numpy())  # [bs, topk]
             y_true.append(targets.cpu().numpy())  # [bs]
@@ -398,4 +415,57 @@ class Learner(BaseLearner):
         # assert y_true.ndim == 1 and y_pred.shape[0] == y_true.shape[0], (y_pred.shape, y_true.shape)
 
         return y_pred, y_true
+
+    def _get_eval_logits_for_fusion(self):
+        """
+        为 BaseLearner.eval_task 的 logits 融合提供专用接口（BOFA 专用）。
+        这里直接复用 _eval_cnn 中用于决策的 ensemble logits：
+        out_ens_gda_mat = stat * out_gda + (1 - stat) * out_update，
+        保证融合是在和 CIL top1 一致的 logits 空间上进行。
+        """
+        self._network.to(self._device)
+        self._network.eval()
+
+        class_to_label = self.data_manager._class_to_label
+        templates = self.data_manager._data_to_prompt
+        total_labels = class_to_label[:self._total_classes]
+
+        text_features = []
+        with torch.no_grad():
+            for l in total_labels:
+                texts = [t.format(l) for t in templates]
+                texts = self._network.tokenizer(texts).to(self._device)
+                class_embeddings = self._network.encode_text(texts)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                class_embeddings = class_embeddings.mean(dim=0)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                text_features.append(class_embeddings)
+        text_proto = torch.stack(text_features, dim=0)  # [C, D]
+
+        logits_list, targets_list = [], []
+        olf = self._network.olf_layer
+        mu = self._network.mu  # [num_classes, D_in]
+
+        for _, (_, inputs, targets) in enumerate(self.test_loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                input_features = self._network.visual_forward_(inputs)  # (B, D_in)
+                per_expert_logits = []
+                for W in olf.W_list:
+                    feats = F.linear(input_features, W)
+                    feats = feats / feats.norm(dim=-1, keepdim=True)
+                    centers = F.linear(mu, W)
+                    proto = centers / centers.norm(dim=-1, keepdim=True)
+                    per_expert_logits.append(feats @ proto.T)
+                out_update = torch.stack(per_expert_logits, dim=0).mean(dim=0)
+                out_gda = self.gda_pred(inputs)
+                out_ens_gda_mat = self.stat * out_gda + (1 - self.stat) * out_update
+
+            logits_list.append(out_ens_gda_mat.cpu().numpy())
+            targets_list.append(targets.cpu().numpy())
+
+        import numpy as _np
+        cil_logits = _np.concatenate(logits_list, axis=0)
+        cil_targets = _np.concatenate(targets_list, axis=0)
+        return cil_logits, cil_targets
 

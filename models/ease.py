@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 import torch
+from copy import deepcopy
 from torch import nn
 from tqdm import tqdm
 from torch import optim
@@ -47,11 +48,13 @@ class Learner(BaseLearner):
         self._network.backbone.add_adapter_to_list()
     
     def get_cls_range(self, task_id):
+        # base-0: first task has inc classes; otherwise first task has init_cls classes
+        first_task_size = self.init_cls if self.init_cls > 0 else self.inc
         if task_id == 0:
             start_cls = 0
-            end_cls = self.init_cls
+            end_cls = first_task_size
         else:
-            start_cls = self.init_cls + (task_id - 1) * self.inc
+            start_cls = first_task_size + (task_id - 1) * self.inc
             end_cls = start_cls + self.inc
         
         return start_cls, end_cls
@@ -235,7 +238,7 @@ class Learner(BaseLearner):
         self.data_manager = data_manager
         self.train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source="train", mode="train", )
         self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
-        
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         self.test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test" )
         self.test_loader = DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
         
@@ -245,12 +248,13 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
-        self._train(self.train_loader, self.test_loader)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self._train(self.train_loader, eval_loader)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
         self.replace_fc(self.train_loader_for_protonet)
 
-    def _train(self, train_loader, test_loader):
+    def _train(self, train_loader, eval_loader):
         self._network.to(self._device)
         
         if self._cur_task == 0 or self.init_cls == self.inc:
@@ -267,7 +271,7 @@ class Learner(BaseLearner):
             optimizer = self.get_optimizer(lr=self.args["later_lr"])
             scheduler = self.get_scheduler(optimizer, self.args["later_epochs"])
 
-        self._init_train(train_loader, test_loader, optimizer, scheduler)
+        self._init_train(train_loader, eval_loader, optimizer, scheduler)
     
     def get_optimizer(self, lr):
         if self.args['optimizer'] == 'sgd':
@@ -302,7 +306,7 @@ class Learner(BaseLearner):
 
         return scheduler
 
-    def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+    def _init_train(self, train_loader, eval_loader, optimizer, scheduler):
         if self.moni_adam:
             if self._cur_task > self.adapter_num - 1:
                 return
@@ -313,7 +317,9 @@ class Learner(BaseLearner):
             epochs = self.args['later_epochs']
         
         prog_bar = tqdm(range(epochs))
-            
+        best_val_acc = 0.0
+        best_model_state = None
+        eval_name = "Val" if self.val_loader is not None else "Test"
         for _, epoch in enumerate(prog_bar):
             self._network.train()
 
@@ -347,25 +353,24 @@ class Learner(BaseLearner):
             if scheduler:
                 scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            test_acc = self._compute_accuracy(test_loader)
-            # info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
-            #     self._cur_task,
-            #     epoch + 1,
-            #     self.args['tuned_epoch'],
-            #     losses / len(train_loader),
-            #     train_acc,
-            #     test_acc,
-            # )
-
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+            eval_acc = self._compute_accuracy(eval_loader)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, {}_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
                     epochs,
                     losses / len(train_loader),
                     train_acc,
+                    eval_name,
+                    eval_acc,
                 )
+            if eval_acc > best_val_acc:
+                best_val_acc = eval_acc
+                best_model_state = deepcopy(self._network.module.state_dict() if isinstance(self._network, nn.DataParallel) else self._network.state_dict())
             prog_bar.set_description(info)
 
+        if best_model_state is not None:
+            (self._network.module if isinstance(self._network, nn.DataParallel) else self._network).load_state_dict(best_model_state)
+            logging.info("Task {}: Restored best checkpoint with {}_acc {:.2f}%".format(self._cur_task, eval_name, best_val_acc))
         logging.info(info)
 
     def _compute_accuracy(self, loader):
@@ -395,28 +400,33 @@ class Learner(BaseLearner):
 
             with torch.no_grad():
                 outputs = self._network.forward(inputs, test=True)["logits"]
-            predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+            k_eff = min(self.topk, outputs.size(1))
+            predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
             
             # calculate the accuracy by using task_id
             if calc_task_acc:
+                first_task_size = self.init_cls if self.init_cls > 0 else self.inc
                 task_ids = (targets - self.init_cls) // self.inc + 1
+                if self.init_cls == 0:
+                    task_ids = torch.clamp(task_ids, min=1)  # base-0: no task_id 0, first inc classes are task 1
                 task_logits = torch.zeros(outputs.shape).to(self._device)
                 for i, task_id in enumerate(task_ids):
                     if task_id == 0:
                         start_cls = 0
-                        end_cls = self.init_cls
+                        end_cls = first_task_size
                     else:
-                        start_cls = self.init_cls + (task_id-1)*self.inc
-                        end_cls = self.init_cls + task_id*self.inc
+                        start_cls = first_task_size + (task_id - 1) * self.inc
+                        end_cls = first_task_size + task_id * self.inc
                     task_logits[i, start_cls:end_cls] += outputs[i, start_cls:end_cls]
                 # calculate the accuracy of task_id
                 pred_task_ids = (torch.max(outputs, dim=1)[1] - self.init_cls) // self.inc + 1
+                if self.init_cls == 0:
+                    pred_task_ids = torch.clamp(pred_task_ids, min=1)
                 task_correct += (pred_task_ids.cpu() == task_ids).sum()
                 
                 pred_task_y = torch.max(task_logits, dim=1)[1]
@@ -426,5 +436,29 @@ class Learner(BaseLearner):
         if calc_task_acc:
             logging.info("Task correct: {}".format(tensor2numpy(task_correct) * 100 / total))
             logging.info("Task acc: {}".format(tensor2numpy(task_acc) * 100 / total))
-                
+
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+
+    def _get_eval_logits_for_fusion(self):
+        """
+        为 BaseLearner.eval_task 的 logits 融合提供专用接口。
+        这里必须与本类自定义的 _eval_cnn 使用同一条前向路径
+        （self._network.forward(..., test=True)["logits"]），
+        否则会出现：
+          - CIL top1 是用 test=True 得到的；
+          - 融合统计里的 cil_top1 用的是 self._network(inputs)["logits"]，
+        造成“Fuse=... 改变样本数为 0，但融合后准确率与 CIL 日志对不上”的现象。
+        """
+        self._network.eval()
+        logits_list, targets_list = [], []
+        for _, (_, inputs, targets) in enumerate(self.test_loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                outputs = self._network.forward(inputs, test=True)["logits"]
+            logits_list.append(outputs.cpu().numpy())
+            targets_list.append(targets.cpu().numpy())
+
+        import numpy as _np
+        cil_logits = _np.concatenate(logits_list, axis=0)
+        cil_targets = _np.concatenate(targets_list, axis=0)
+        return cil_logits, cil_targets

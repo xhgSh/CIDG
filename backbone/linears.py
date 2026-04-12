@@ -2,7 +2,10 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from timm.layers import trunc_normal_
+try:
+    from timm.layers import trunc_normal_
+except ImportError:
+    from timm.models.layers import trunc_normal_
 
 from copy import deepcopy
 
@@ -284,12 +287,13 @@ class EaseCosineLinear(nn.Module):
 
     def forward_reweight(self, input, cur_task, alpha=0.1, beta=0.0, init_cls=10, inc=10, out_dim=768,
                          use_init_ptm=False):
+        first_task_size = init_cls if init_cls > 0 else inc  # base-0: first segment has inc classes
         for i in range(cur_task + 1):
             if i == 0:
                 start_cls = 0
-                end_cls = init_cls
+                end_cls = first_task_size
             else:
-                start_cls = init_cls + (i - 1) * inc
+                start_cls = first_task_size + (i - 1) * inc
                 end_cls = start_cls + inc
 
             out = 0.0
@@ -418,6 +422,9 @@ class OLF(nn.Module):
         self.W_task.requires_grad = False
 
         if self.task_id == 0:
+            self.W_list.append(self.W_task.data.clone().detach())
+        elif getattr(self, "_skip_stage2_fusion", False):
+            # 未做 Stage 2 训练时融合用 Stage 1 的 W_task，避免与 Stage 2 权重混用导致测试崩盘
             self.W_list.append(self.W_task.data.clone().detach())
         else:
             diff_W = self.B @ self.A.T

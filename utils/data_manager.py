@@ -283,7 +283,9 @@ class DataManager(object):
             path = "./utils/clg_cbm/concepts/ucf101.json"
         elif attribute == "cars": 
             path = "./utils/clg_cbm/concepts/cars/cars_4o_simple_cpts.json"
-        elif attribute == "imagenetr": 
+        elif attribute == "imagenetr":
+            path = "./utils/clg_cbm/concepts/imagenetr.json"
+        elif attribute == "imageneta":
             path = "./utils/clg_cbm/concepts/imagenetr.json"
         elif attribute == "aircraft":
             path = "./utils/clg_cbm/concepts/aircraft.json"
@@ -318,6 +320,7 @@ class DataManager(object):
         elif name == "cars": return "A photo of the car with"
         elif name == 'ucf101': return "A photo of a person with "
         elif name == 'imagenetr': return "A photo of the object with "
+        elif name == 'imageneta': return "A photo of the object with "
         elif name == 'imagenet100': return "A good photo of an object with "
         elif name == 'aircraft': return "a photo of an aircraft with"
         elif name == 'sun': return "a photo with"

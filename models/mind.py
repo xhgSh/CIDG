@@ -18,7 +18,17 @@ from models.base import BaseLearner
 from backbone.mind_model import VisionClassifier
 from torch import nn
 num_workers = 8
-import clip
+try:
+    import clip
+    def _clip_tokenize(texts):
+        return clip.tokenize(texts)
+except ImportError:
+    import open_clip
+    _open_clip_tok = open_clip.get_tokenizer("ViT-B-16")
+    def _clip_tokenize(texts):
+        return _open_clip_tok(texts)
+
+
 class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
@@ -59,14 +69,18 @@ class Learner(BaseLearner):
     def adaptation(self, reset=False):
         # self.current_task +=1 
         if reset and self._cur_task >0:
-            ori_state = torch.load('ori_state.pth')
-            if self.only_reset_B:
-                now_state = self._network.model.state_dict()
-                lora_params = {k: v for k, v in ori_state.items() if 'lora_B' in k}
-                now_state.update(lora_params)
+            ori_state_path = 'ori_state.pth'
+            if not os.path.isfile(ori_state_path):
+                logging.warning("ori_state.pth not found, skipping LoRA reset.")
             else:
-                now_state = ori_state
-            self._network.model.load_state_dict(now_state)
+                ori_state = torch.load(ori_state_path, map_location="cpu", weights_only=True)
+                if self.only_reset_B:
+                    now_state = self._network.model.state_dict()
+                    lora_params = {k: v for k, v in ori_state.items() if 'lora_B' in k}
+                    now_state.update(lora_params)
+                else:
+                    now_state = ori_state
+                self._network.model.load_state_dict(now_state)
 
         if self.freeze_A and self._cur_task >0:
             for name, param in self._network.model.named_parameters():
@@ -77,17 +91,17 @@ class Learner(BaseLearner):
         self.current_class_names = self.classnames[:self._total_classes]
         self.current_task_class_names = self.classnames[self._known_classes:self._total_classes]
 
-        self._network.text_tokens = clip.tokenize(
+        self._network.text_tokens = _clip_tokenize(
             ["a good photo of a {}.".format(c) for c in self.current_class_names]
         ).to(self._device)
-        self.current_task_text_tokens = clip.tokenize(
+        self.current_task_text_tokens = _clip_tokenize(
             ["a good photo of a {}.".format(c) for c in self.current_task_class_names]
         ).to(self._device)
 
         if self._cur_task == 0:
             self.all_class_names = self.classnames
-            self._network.all_text_tokens = clip.tokenize(
-                ["a good photo of a {}." for c in self.all_class_names]
+            self._network.all_text_tokens = _clip_tokenize(
+                ["a good photo of a {}.".format(c) for c in self.all_class_names]
             ).to(self._device)
             
         # self.text_tokens = self._network.tokenizer(
@@ -105,9 +119,12 @@ class Learner(BaseLearner):
 
 
     def modality_gap(self, loader):
-
-        trainable_params = torch.load(f'ori_params.pth')
-        self._network.load_state_dict(trainable_params, strict=False)
+        ori_params_path = 'ori_params.pth'
+        if os.path.isfile(ori_params_path):
+            trainable_params = torch.load(ori_params_path, map_location="cpu", weights_only=True)
+            self._network.load_state_dict(trainable_params, strict=False)
+        else:
+            logging.warning("ori_params.pth not found, skipping load for modality_gap.")
         self._network.eval()
         positive_outputs = []
         negative_outputs = []
@@ -168,7 +185,7 @@ class Learner(BaseLearner):
         self.data_manager = data_manager
         self.classnames = self.data_manager._class_to_label
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
-   
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
@@ -192,20 +209,22 @@ class Learner(BaseLearner):
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
 
         self.modality_gap(self.train_loader_for_protonet)
-        
-        self._train(self.train_loader, self.test_loader,self.train_loader_for_protonet)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self._train(self.train_loader, eval_loader, self.train_loader_for_protonet)
         self._train_visual(self.visual_loader)
         if self.real_replay:
             self.build_rehearsal_memory(data_manager, self.samples_per_class)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
-    def _train(self, train_loader, test_loader, train_loader_for_protonet):
+    def _train(self, train_loader, eval_loader, train_loader_for_protonet):
+        trainable_params_path = 'trainable_params.pth'
+        if os.path.isfile(trainable_params_path):
+            trainable_params = torch.load(trainable_params_path, map_location="cpu", weights_only=True)
+            self._network.load_state_dict(trainable_params, strict=False)
+        else:
+            logging.warning("trainable_params.pth not found, using current network params.")
 
-        trainable_params = torch.load(f'trainable_params.pth',weights_only=True)
-        self._network.load_state_dict(trainable_params, strict=False)
-        
-        
         params = filter(lambda p: p.requires_grad, self._network.parameters())
 
         optimizer = torch.optim.Adam(params, lr=self.init_lr)
@@ -426,7 +445,11 @@ class Learner(BaseLearner):
                 else:
                     outputs = self._network(inputs, test=True, all_test=self.all_test)
 
-                predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]  # [bs, topk]
+                k_eff = min(self.topk, outputs.size(1))
+                predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+                if k_eff < self.topk:
+                    pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                    predicts = torch.cat([predicts, pad], dim=1)
 
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())

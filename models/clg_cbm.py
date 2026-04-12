@@ -6,7 +6,16 @@ import random
 import torch
 import copy
 from copy import deepcopy
-import clip
+try:
+    import clip
+except ImportError:
+    import open_clip
+    _open_clip_tok = open_clip.get_tokenizer("ViT-B-16")
+    class _ClipShim:
+        @staticmethod
+        def tokenize(texts):
+            return _open_clip_tok(texts)
+    clip = _ClipShim()
 from torch import nn
 from torch import optim
 from torch.nn import functional as F
@@ -104,6 +113,7 @@ class Learner(BaseLearner):
         # Attributes selection
         self.stage = 0
         attributes, names, counter = self.data_manager.get_attributes(self.args["dataset"].lower(),concept_cls)
+        num_attributes = min(num_attributes or len(attributes), len(attributes))
         attribute_embeddings = []
         templates = self.data_manager._data_to_prompt[0]
         # extract text features
@@ -179,6 +189,7 @@ class Learner(BaseLearner):
         self._network.to(self._device)
 
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source='test', mode='test')
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
         # Evaluation
@@ -191,6 +202,8 @@ class Learner(BaseLearner):
 
         self.names  = class_names if self.names == None else torch.cat((self.names,class_names),dim=0) 
         self.bottleneck = attributes_embeddings.to(self._device) if self.bottleneck is None else torch.concat((self.bottleneck,attributes_embeddings.to(self._device)),dim=0)
+        # pool must match actual number of attributes (e.g. DG has few concepts per task)
+        self.pool = self.bottleneck.shape[0]
         
         self.bottle_dict[self._cur_task] = self.bottleneck
         self.cpt_table.append(self.bottleneck.shape[0])
@@ -205,7 +218,8 @@ class Learner(BaseLearner):
         
         self.stage=1
         self._network.update_explainer(self.pool,task_size,bias=False)
-        self._network.explainer, self._network.unity = self._train(self._network,self.train_loader,self.test_loader)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self._network.explainer, self._network.unity = self._train(self._network, self.train_loader, eval_loader)
         
         self.test_loader = self.eval_test_loader
         
@@ -311,7 +325,11 @@ class Learner(BaseLearner):
         else: img_feats = inputs.float()
         distance_loss = nn.MSELoss()
         if sg is not None: img_feats = torch.cat((img_feats,sg),dim=0).float()
-        target_feats = img_feats @ bottleneck.T 
+        target_feats = img_feats @ bottleneck.T
+        # align csv dim to bottleneck (e.g. when pool > num attributes in DG)
+        n_cpt = bottleneck.shape[0]
+        if csv.size(1) != n_cpt:
+            csv = csv[:, :n_cpt]
 
         target_feats, csv = target_feats**3, csv**3
         target_feats = target_feats / torch.norm(target_feats, p=2, dim=0, keepdim=True)
@@ -430,7 +448,11 @@ class Learner(BaseLearner):
 
                 logits,CSV = self._network.forward_explainer(inputs)
                 
-                predicts = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]  # [bs, topk]
+                k_eff = min(self.topk, logits.size(1))
+                predicts = torch.topk(logits, k=k_eff, dim=1, largest=True, sorted=True)[1]
+                if k_eff < self.topk:
+                    pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                    predicts = torch.cat([predicts, pad], dim=1)
 
                 y_pred.append(predicts.cpu().numpy())
                 y_true.append(targets.cpu().numpy())

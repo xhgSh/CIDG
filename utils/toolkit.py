@@ -45,8 +45,9 @@ def accuracy(y_pred, y_true, nb_old, increment=10):
     idxes = np.where(y_true >= nb_old)[0]
     all_acc["new"] = (0 if len(idxes) == 0 else np.around((y_pred[idxes] == y_true[idxes]).sum() * 100 / len(idxes), decimals=2))
 
-    # Harmonic mean of old and new accuracy
-    all_acc["harmonic"] = np.around(2 * all_acc["old"] * all_acc["new"] / (all_acc["old"] + all_acc["new"]), decimals=2)
+    # Harmonic mean of old and new accuracy (avoid 0/0)
+    s = all_acc["old"] + all_acc["new"]
+    all_acc["harmonic"] = np.around(2 * all_acc["old"] * all_acc["new"] / s, decimals=2) if s > 0 else 0.0
     return all_acc
 
 

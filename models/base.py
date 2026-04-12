@@ -1,5 +1,6 @@
 import copy
 import logging
+import time
 import numpy as np
 import torch
 from torch import nn
@@ -26,6 +27,8 @@ class BaseLearner(object):
         self._fixed_memory = args.get("fixed_memory", False)
         self._device = args["device"][0]
         self._multiple_gpus = args["device"]
+        # CIL + ZS logits 融合：fuse 为标量或列表，new_logits = cil_logits + fuse * zs_logits，用 new_logits 分类。
+        self.fuse = args.get("fuse", None)
 
     @property
     def exemplar_size(self):
@@ -49,7 +52,19 @@ class BaseLearner(object):
         else:
             return self._network.feature_dim
 
+    def _create_val_loader_if_available(self, data_manager):
+        """Create val_loader if data_manager supports source='val' (for CIDG)."""
+        try:
+            val_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="val", mode="test")
+            from torch.utils.data import DataLoader
+            return DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=8)
+        except (ValueError, KeyError, AttributeError):
+            return None
+
     def build_rehearsal_memory(self, data_manager, per_class):
+        if per_class is not None and per_class <= 0:
+            # No exemplars (e.g. memory_size=0): skip construction to avoid empty concatenate
+            return
         if self._fixed_memory:
             self._construct_exemplar_unified(data_manager, per_class)
         else:
@@ -85,53 +100,127 @@ class BaseLearner(object):
         return ret
 
     def eval_task(self):
+        """
+        评估当前 task：
+        - cnn_accy: 融合前纯 CIL 的准确率
+        - fuse_accy: 对每个 fuse 值，用 归一化后的 logits 融合：cil_norm + fuse * zs_norm（按样本 L2 归一化），再 argmax 得到预测后的准确率
+        """
+        # 1) 融合前：纯 CIL 的 top-k 预测
         y_pred, y_true = self._eval_cnn(self.test_loader)
         cnn_accy = self._evaluate(y_pred, y_true)
 
+        # 2) 融合：仅当设置了 fuse 且提供了 zs_result 表时启用
+        fuse_accy = None
+        fuse_param = getattr(self, "fuse", None)
+        zs_table = getattr(self, "zs_gate_table", None)
+        if fuse_param is not None and zs_table is not None:
+            try:
+                import pandas as pd
+                import numpy as _np
+
+                if isinstance(zs_table, pd.DataFrame):
+                    df = zs_table
+                else:
+                    df = pd.DataFrame(zs_table)
+                n = len(y_true)
+                if len(df) != n:
+                    logging.warning(
+                        "ZS fusion skipped: row count mismatch (zs_table=%d, cil=%d)",
+                        len(df), n,
+                    )
+                else:
+                    logit_cols = [c for c in df.columns if str(c).startswith("logit_")]
+                    if not logit_cols:
+                        logging.warning("ZS fusion skipped: zs_table has no 'logit_*' columns.")
+                    else:
+                        zs_logits_raw = df[logit_cols].values  # [N, C_zs]
+
+                        # 2.1 获取当前 CIL logits
+                        # 对大多数模型，直接通过 self._network(inputs)["logits"] 计算；
+                        # 对如 Engine 等自定义模型，则提供 _get_eval_logits_for_fusion 钩子专门返回 logits。
+                        if hasattr(self, "_get_eval_logits_for_fusion"):
+                            cil_logits, cil_targets = self._get_eval_logits_for_fusion()
+                        else:
+                            self._network.eval()
+                            aug = getattr(self, "aug_helper", None)
+                            use_tta = aug and aug.num_test_views() > 0
+                            cil_logits_list = []
+                            cil_targets_list = []
+                            for _, (_, inputs, targets) in enumerate(self.test_loader):
+                                inputs = inputs.to(self._device)
+                                with torch.no_grad():
+                                    if use_tta:
+                                        outputs = aug.forward_tta(self._network, inputs, self._device, output_key="logits")
+                                    else:
+                                        outputs = self._network(inputs)["logits"]
+                                cil_logits_list.append(outputs.cpu().numpy())
+                                cil_targets_list.append(targets.cpu().numpy())
+
+                            cil_logits = _np.concatenate(cil_logits_list, axis=0)
+                            cil_targets = _np.concatenate(cil_targets_list, axis=0)
+                        if cil_logits.shape[0] != n or not _np.array_equal(cil_targets, y_true):
+                            logging.warning(
+                                "ZS fusion skipped: CIL logits/targets mismatch (logits=%d, y_true=%d)",
+                                cil_logits.shape[0], n,
+                            )
+                        else:
+                            c_eff = int(getattr(self, "_total_classes", cil_logits.shape[1]) or cil_logits.shape[1])
+                            c_eff = max(1, min(c_eff, int(cil_logits.shape[1])))
+                            cil_logits_eff = cil_logits[:, :c_eff].astype(_np.float64)
+
+                            C_zs = zs_logits_raw.shape[1]
+                            if C_zs >= c_eff:
+                                zs_eff = _np.asarray(zs_logits_raw[:, :c_eff], dtype=_np.float64)
+                            else:
+                                zs_eff = _np.zeros((n, c_eff), dtype=_np.float64)
+                                zs_eff[:, :C_zs] = zs_logits_raw
+
+                            # 按样本 L2 归一化后再融合，超参数尺度更稳定
+                            _eps = 1e-12
+                            cil_norm = cil_logits_eff / (_np.linalg.norm(cil_logits_eff, axis=1, keepdims=True) + _eps)
+                            zs_norm = zs_eff / (_np.linalg.norm(zs_eff, axis=1, keepdims=True) + _eps)
+
+                            if isinstance(fuse_param, (list, tuple, _np.ndarray)):
+                                fuse_list = [float(x) for x in fuse_param]
+                            else:
+                                fuse_list = [float(fuse_param)]
+                            fuse_list = sorted(set(fuse_list))
+
+                            cil_top1 = _np.argmax(cil_logits_eff, axis=1).astype(_np.int64)  # 纯 CIL 预测（未归一化）
+
+                            fuse_accy = {}
+                            for f in fuse_list:
+                                fused_logits = cil_norm + float(f) * zs_norm
+                                fused_top1 = _np.argmax(fused_logits, axis=1).astype(_np.int64)
+                                n_changed = int((fused_top1 != cil_top1).sum())
+                                pct_changed = 100.0 * float(n_changed) / float(n) if n > 0 else 0.0
+                                logging.info(
+                                    "Fuse=%.4f | 相较 CIL 预测改变: %d/%d (%.1f%%)",
+                                    float(f), n_changed, n, pct_changed,
+                                )
+                                print(
+                                    "  [融合 fuse=%.4f] 相较 CIL 预测改变: %d/%d (%.1f%%)"
+                                    % (float(f), n_changed, n, pct_changed),
+                                    flush=True,
+                                )
+                                y_pred_fused = y_pred.copy()
+                                y_pred_fused[:, 0] = fused_top1
+                                fuse_accy[float(f)] = self._evaluate(y_pred_fused, y_true)
+            except Exception as e:
+                logging.warning("ZS fusion failed: %s", e)
+
+        # 3) NME 分支照旧
         if hasattr(self, "_class_means"):
             y_pred, y_true = self._eval_nme(self.test_loader, self._class_means)
             nme_accy = self._evaluate(y_pred, y_true)
         else:
             nme_accy = None
-        return cnn_accy, nme_accy, None, None, None, None
-        
 
-    def _eval_zero_shot(self):  
-        self._network.eval()
-        class_to_label=self.data_manager._class_to_label
-        templates=self.data_manager._data_to_prompt
-        total_labels=class_to_label#[:self._total_classes] # mask all known classes
-        text_features = []
-        with torch.no_grad():
-            for l in total_labels:
-                texts = [t.format(l) for t in templates]
-                texts = self._network.tokenizer(texts).cuda()
-                class_embeddings = self._network.encode_text(texts)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                class_embeddings = class_embeddings.mean(dim=0)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                text_features.append(class_embeddings)
-            text_features = torch.stack(text_features, dim=0)
+        return cnn_accy, nme_accy, fuse_accy, None, None, None
 
-        test_dataset = self.data_manager.get_dataset(np.arange(0, len(total_labels)), source="test", mode="test" )
-        loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=8)
-
-        y_pred, y_true = [], []
-        logits=[]
-        for _, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.to(self._device)
-            with torch.no_grad():
-                image_features=self._network.encode_image(inputs)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
-                outputs= image_features @ text_features.T
-            predicts = torch.topk( outputs, k=self.topk, dim=1, largest=True, sorted=True )[  1 ]  
-            y_pred.append(predicts.cpu().numpy())
-            y_true.append(targets.cpu().numpy())
-            logits.append(outputs.cpu().numpy())
-        
-
-        return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
-
+    def _eval_zero_shot(self):
+        """Zero-shot 评估请使用 zs_clip 模型；BaseLearner 不实现 CLIP 前向。"""
+        raise NotImplementedError("Use zs_clip model for zero-shot evaluation.")
 
     def incremental_train(self):
         pass
@@ -162,15 +251,22 @@ class BaseLearner(object):
     def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
+        aug = getattr(self, "aug_helper", None)
+        use_tta = aug and aug.num_test_views() > 0
         for _, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
             with torch.no_grad():
-                outputs = self._network(inputs)["logits"]
+                if use_tta:
+                    outputs = aug.forward_tta(self._network, inputs, self._device, output_key="logits")
+                else:
+                    outputs = self._network(inputs)["logits"]
+            k_eff = min(self.topk, outputs.size(1))
             predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+                outputs, k=k_eff, dim=1, largest=True, sorted=True
+            )[1]  # [bs, k_eff]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
@@ -185,7 +281,12 @@ class BaseLearner(object):
         dists = cdist(class_means, vectors, "sqeuclidean")  # [nb_classes, N]
         scores = dists.T  # [N, nb_classes], choose the one with the smallest distance
 
-        return np.argsort(scores, axis=1)[:, : self.topk], y_true  # [N, topk]
+        k_eff = min(scores.shape[1], self.topk)
+        preds = np.argsort(scores, axis=1)[:, :k_eff]
+        if k_eff < self.topk:
+            pad = np.tile(preds[:, :1], (1, self.topk - k_eff))
+            preds = np.hstack([preds, pad])
+        return preds, y_true  # [N, topk]
 
     def _extract_vectors(self, loader):
       #  self._network.eval()

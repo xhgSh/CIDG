@@ -14,6 +14,7 @@ from utils.data_manager import LaionData
 import math
 import matplotlib.pyplot as plt
 import os
+from copy import deepcopy
 
 
 num_workers = 8
@@ -79,6 +80,9 @@ class Learner(BaseLearner):
         self._network.to(self._device)
        
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        # CIDG: use val (source validation) for training-time evaluation, test (held-out domain) only for final eval
+        val_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="val", mode="test")
+        self.val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test" )
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
@@ -90,12 +94,12 @@ class Learner(BaseLearner):
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
 
         self.cal_prototype(self.train_loader_for_protonet, self._network)
-        self._train_proj(self.train_loader, self.test_loader, self.train_loader_for_protonet)
+        self._train_proj(self.train_loader, self.val_loader, self.train_loader_for_protonet)
         self.build_rehearsal_memory(data_manager, self.samples_per_class)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
     
-    def _train_proj(self, train_loader, test_loader, train_loader_for_protonet):
+    def _train_proj(self, train_loader, val_loader, train_loader_for_protonet):
         self._train_transformer=True
         self._network.to(self._device)
        
@@ -119,6 +123,8 @@ class Learner(BaseLearner):
         cliploss = ClipLoss()
 
         total_labels = class_to_label[:self._total_classes] # mask all known classes
+        best_val_acc = 0.0
+        best_model_state = None
         for _, epoch in enumerate(prog_bar):
             self._network.train()
             losses = 0.0
@@ -161,10 +167,26 @@ class Learner(BaseLearner):
 
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            test_acc = self._compute_accuracy(self._network, test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_acc {:.2f}, Test_acc {:.2f}".format(
-                self._cur_task,epoch + 1,self.args['tuned_epoch'],losses / len(train_loader),train_acc, test_acc,  )
+            val_acc = self._compute_accuracy(self._network, val_loader)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_acc {:.2f}, Val_acc {:.2f}".format(
+                self._cur_task,epoch + 1,self.args['tuned_epoch'],losses / len(train_loader),train_acc, val_acc,  )
             prog_bar.set_description(info)
+            
+            # Save best checkpoint based on val acc
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                if isinstance(self._network, nn.DataParallel):
+                    best_model_state = deepcopy(self._network.module.state_dict())
+                else:
+                    best_model_state = deepcopy(self._network.state_dict())
+        
+        # Restore best model
+        if best_model_state is not None:
+            if isinstance(self._network, nn.DataParallel):
+                self._network.module.load_state_dict(best_model_state)
+            else:
+                self._network.load_state_dict(best_model_state)
+            logging.info("Task {}: Restored best checkpoint with Val_acc {:.2f}%".format(self._cur_task, best_val_acc))
 
 
     def _compute_accuracy(self, model, loader):
@@ -219,6 +241,10 @@ class Learner(BaseLearner):
                 text_features.append(class_embeddings)
             text_features = torch.stack(text_features, dim=0)
 
+        # Sanity check: logits must be over exactly _total_classes (avoids wrong-class eval bug)
+        assert text_features.shape[0] == self._total_classes, "PROOF eval: text_features classes {} != _total_classes {}".format(text_features.shape[0], self._total_classes)
+        logging.info("PROOF eval_task: _total_classes=%d (logits over %d classes)", self._total_classes, text_features.shape[0])
+
         y_pred, y_true = [], []
         for _, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
@@ -234,10 +260,65 @@ class Learner(BaseLearner):
 
                 outputs = original_outputs+outputs+proto_outputs
 
-            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]  # [bs, topk]
+            assert outputs.size(1) == self._total_classes, "PROOF eval: logits dim {} != _total_classes {}".format(outputs.size(1), self._total_classes)
+            k_eff = min(self.topk, outputs.size(1))
+            predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+
+    def _get_eval_logits_for_fusion(self):
+        """
+        为 BaseLearner.eval_task 的 logits 融合提供专用接口（PROOF 专用）。
+        这里返回与 _eval_cnn 完全一致的 logits：
+        outputs = original_outputs + outputs + proto_outputs，
+        维度为 [N, _total_classes]，确保融合前后基线一致。
+        """
+        self._network.eval()
+        class_to_label = self.data_manager._class_to_label
+        templates = self.data_manager._data_to_prompt
+        total_labels = class_to_label[:self._total_classes]  # mask all known classes
+        text_features = []
+        with torch.no_grad():
+            for l in total_labels:
+                texts = [t.format(l) for t in templates]
+                texts = self._network.tokenizer(texts).to(self._device)
+                class_embeddings = self._network.encode_text(texts)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                class_embeddings = class_embeddings.mean(dim=0)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                text_features.append(class_embeddings)
+            text_features = torch.stack(text_features, dim=0)
+
+        assert text_features.shape[0] == self._total_classes, \
+            "PROOF fusion: text_features classes {} != _total_classes {}".format(
+                text_features.shape[0], self._total_classes
+            )
+
+        logits_list, targets_list = [], []
+        for _, (_, inputs, targets) in enumerate(self.test_loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                image_features = self._network.encode_image(inputs)
+                transf_image_features, transf_text_features, _, proto_feas = self._network.forward_transformer(
+                    image_features, text_features, self._train_transformer
+                )
+
+                outputs = transf_image_features @ transf_text_features.T
+                proto_outputs = transf_image_features @ proto_feas.T
+                original_outputs = image_features @ text_features.T
+                logits = original_outputs + outputs + proto_outputs
+
+            logits_list.append(logits.cpu().numpy())
+            targets_list.append(targets.cpu().numpy())
+
+        import numpy as _np
+        cil_logits = _np.concatenate(logits_list, axis=0)
+        cil_targets = _np.concatenate(targets_list, axis=0)
+        return cil_logits, cil_targets
 
 

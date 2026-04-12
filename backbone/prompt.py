@@ -35,6 +35,9 @@ class CodaPrompt(nn.Module):
         self.ortho_mu = prompt_param[2]
 
     def process_task_count(self):
+        # 避免 task_count 超过预设 n_tasks，导致 Gram-Schmidt 越界
+        if self.task_count >= self.n_tasks - 1:
+            return
         self.task_count += 1
         # in the spirit of continual learning, we will reinit the new components
         # for the new task with Gram Schmidt
@@ -78,10 +81,18 @@ class CodaPrompt(nn.Module):
         nk = vv.size(1)
         uu = torch.zeros_like(vv, device=vv.device)
 
-        # get starting point
-        pt = int(self.e_pool_size / (self.n_tasks))
+        # get starting point（加上边界保护，防止 s/f 超出 nk）
+        pt = max(1, int(self.e_pool_size / max(1, self.n_tasks)))
         s = int(self.task_count * pt)
         f = int((self.task_count + 1) * pt)
+        s = max(0, min(s, nk))
+        f = max(s, min(f, nk))
+        if s >= nk:
+            # 所有列都已初始化过，直接返回原始参数
+            uu = vv.T
+            if is_3d:
+                uu = uu.view(shape_2d)
+            return torch.nn.Parameter(uu)
         if s > 0:
             uu[:, 0:s] = vv[:, 0:s].clone()
         for k in range(s, f):

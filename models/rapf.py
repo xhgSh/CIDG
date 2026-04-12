@@ -65,14 +65,16 @@ class Learner(BaseLearner):
         self.classnames = self.data_manager._class_to_label
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
         self.sample_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
         self._network.to(self._device)
         self.adaptation(self._cur_task, self.threshold)
-        self._train(self.train_loader, self.test_loader, self.sample_loader)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self._train(self.train_loader, eval_loader, self.sample_loader)
 
-    def _train(self,train_loader,test_loader,sample_loader):
+    def _train(self, train_loader, eval_loader, sample_loader):
         optimizer = torch.optim.Adam(self.adapter.parameters(), lr=self.init_lr, weight_decay=0.0000)
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, self.milestones, gamma=0.1, last_epoch=-1)
         prog_bar = tqdm(range(self.epochs))
@@ -148,11 +150,17 @@ class Learner(BaseLearner):
                 loss.backward()
                 optimizer.step()
             scheduler.step()
-           # train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            test_acc = self._compute_accuracy(self._network, test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Test_acc {:.2f}".format(
-                self._cur_task, epoch + 1, self.args['epochs'], loss / len(train_loader), test_acc, )
+            eval_acc = self._compute_accuracy(self._network, eval_loader)
+            eval_name = "Val" if self.val_loader is not None else "Test"
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, {}_acc {:.2f}".format(
+                self._cur_task, epoch + 1, self.args['epochs'], loss / len(train_loader), eval_name, eval_acc, )
             prog_bar.set_description(info)
+            if eval_acc > getattr(self, "_best_val_acc_rapf", 0):
+                self._best_val_acc_rapf = eval_acc
+                self._best_model_state_rapf = copy.deepcopy(self._network.module.state_dict() if isinstance(self._network, nn.DataParallel) else self._network.state_dict())
+        if getattr(self, "_best_model_state_rapf", None) is not None:
+            (self._network.module if isinstance(self._network, nn.DataParallel) else self._network).load_state_dict(self._best_model_state_rapf)
+            logging.info("Task {}: Restored best checkpoint with {}_acc {:.2f}%".format(self._cur_task, eval_name, self._best_val_acc_rapf))
         sample_data = []
         sample_target = []
         for i, (_, inputs, targets) in enumerate(sample_loader):
@@ -284,11 +292,11 @@ class Learner(BaseLearner):
             inputs = inputs.to(self._device)
             with torch.no_grad():
                 outputs,_,_,_ = self.forward_once(inputs)
-            predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+            k_eff = min(self.topk, outputs.size(1))
+            predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 

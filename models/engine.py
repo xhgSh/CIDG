@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 import torch
+from copy import deepcopy
 from torch import nn
 from torch.serialization import load
 from tqdm import tqdm
@@ -47,21 +48,33 @@ class Learner(BaseLearner):
 
     def _get_text_des(self, dataname='cifar224'):
         des_path = "./utils/engine/chat/" + dataname + '_des.json'
+        if not os.path.isfile(des_path):
+            logging.warning("Description file not found: %s, using placeholder (class name only).", des_path)
+            self.des_dict = {}
+            return {}
         with open(des_path, 'r') as f:
             des_dict = json.load(f)
         self.des_dict = des_dict
         new_des_dict = {}
         for key, value in des_dict.items():
             new_key_value = []
-            for k, v in value.items():
-                new_key_value.extend(v)
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    new_key_value.extend(v)
+            elif isinstance(value, list):
+                new_key_value = value
+            else:
+                new_key_value = [str(value)]
             new_des_dict[key] = new_key_value
         return new_des_dict
 
     def _get_batch_des(self, des_file, classnames):
         batch_des = []
         for classname in classnames:
-            batch_des.append(classname + ' with ' + random.choice(des_file[classname]).lower())
+            choices = des_file.get(classname, [classname])
+            if not choices:
+                choices = [classname]
+            batch_des.append(classname + ' with ' + random.choice(choices).lower())
         return batch_des
 
     def incremental_train(self, data_manager):
@@ -75,6 +88,7 @@ class Learner(BaseLearner):
         self.data_manager = data_manager
         self._network.to(self._device)
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        self.val_loader = self._create_val_loader_if_available(data_manager)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
         if len(self._multiple_gpus) > 1:
@@ -84,9 +98,10 @@ class Learner(BaseLearner):
             self._network = self._network.module
         self._network.update_task()
         self._network.update_stat(self._known_classes, self._total_classes, self.train_loader, self._device)
-        self.train(self.train_loader, self.test_loader, train_dataset)
+        eval_loader = self.val_loader if self.val_loader is not None else self.test_loader
+        self.train(self.train_loader, eval_loader, train_dataset)
 
-    def train(self, train_loader, test_loader, train_dataset):
+    def train(self, train_loader, eval_loader, train_dataset):
         self._network.to(self._device)
         if self.args['optimizer'] == 'sgd':
             optimizer = optim.SGD(self._network.parameters(), momentum=0.9, lr=self.init_lr,
@@ -102,13 +117,17 @@ class Learner(BaseLearner):
 
         from utils.toolkit import ClipLoss
         cliploss = ClipLoss()
+        best_val_acc = 0.0
+        best_model_state = None
+        eval_name = "Val" if self.val_loader is not None else "Test"
         for _, epoch in enumerate(prog_bar):
             self._network.train()
             losses = 0.0
             correct, total = 0, 0
             correct_clip = []
             if self._cur_task > 0:
-                old_class = list(range(self.args['init_cls'] + (self._cur_task - 1) * self.args['increment']))
+                # use _known_classes so base-0 (init_cls=0) has correct old classes, e.g. [0,1] at task 1
+                old_class = list(range(self._known_classes))
                 random.shuffle(old_class)
             for i, (_, inputs, targets) in enumerate(train_loader):
 
@@ -188,10 +207,17 @@ class Learner(BaseLearner):
 
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            test_acc = self._compute_accuracy(self._network, test_loader, epoch)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_acc {:.2f}, Test_acc {:.2f}".format(
-                self._cur_task, epoch + 1, self.args['tuned_epoch'], losses / len(train_loader), train_acc, test_acc, )
+            eval_acc = self._compute_accuracy(self._network, eval_loader, epoch)
+            eval_name = "Val" if self.val_loader is not None else "Test"
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_acc {:.2f}, {}_acc {:.2f}".format(
+                self._cur_task, epoch + 1, self.args['tuned_epoch'], losses / len(train_loader), train_acc, eval_name, eval_acc, )
             prog_bar.set_description(info)
+            if eval_acc > best_val_acc:
+                best_val_acc = eval_acc
+                best_model_state = deepcopy(self._network.module.state_dict() if isinstance(self._network, nn.DataParallel) else self._network.state_dict())
+        if best_model_state is not None:
+            (self._network.module if isinstance(self._network, nn.DataParallel) else self._network).load_state_dict(best_model_state)
+            logging.info("Task {}: Restored best checkpoint with {}_acc {:.2f}%".format(self._cur_task, eval_name, best_val_acc))
         self._network.eval()
         # analyze
         sample_loader = DataLoader(train_dataset, batch_size=64, shuffle=False, num_workers=8)
@@ -303,7 +329,73 @@ class Learner(BaseLearner):
                 outputs = outputs_gda * self.args['stat'] + (
                             self.args['rerank'] * outputs_rerank + (1 - self.args['rerank']) * outputs) * (
                                       1 - self.args['stat'])
-            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]  # [bs, topk]
+            k_eff = min(self.topk, outputs.size(1))
+            predicts = torch.topk(outputs, k=k_eff, dim=1, largest=True, sorted=True)[1]
+            if k_eff < self.topk:
+                pad = predicts[:, :1].expand(-1, self.topk - k_eff)
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+
+    def _get_eval_logits_for_fusion(self):
+        """
+        提供给 BaseLearner.eval_task 的融合钩子：
+        返回当前 test_loader 上 Engine 的最终 logits（与 _eval_cnn 一致的决策空间）以及对应标签。
+        """
+        import numpy as _np
+
+        self._network.to(self._device)
+        self._network.eval()
+        class_to_label = self.data_manager._class_to_label
+        templates = self.data_manager._data_to_prompt
+        total_labels = class_to_label[:self._total_classes]  # mask all known classes
+
+        # 文本特征，与 _eval_cnn 保持一致
+        text_features = []
+        with torch.no_grad():
+            for l in total_labels:
+                texts = [t.format(l) for t in templates]
+                texts = self._network.tokenizer(texts).cuda()
+                class_embeddings = self._network.encode_text(texts)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                class_embeddings = class_embeddings.mean(dim=0)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                text_features.append(class_embeddings)
+            text_features = torch.stack(text_features, dim=0).to(self._device)
+
+        logits_list = []
+        targets_list = []
+        for _, (_, inputs, targets) in enumerate(self.test_loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                transf_image_features = self._network.encode_image(inputs)
+                transf_image_features = transf_image_features / transf_image_features.norm(dim=-1, keepdim=True)
+                transf_text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+                transf_image_features_raw_ = self._network.visual_forward_(inputs)
+                transf_image_features_raw = transf_image_features_raw_ @ self._network.visual_proj
+                transf_image_features_raw_ = transf_image_features_raw_ / transf_image_features_raw_.norm(
+                    dim=-1, keepdim=True
+                )
+                transf_image_features_raw = transf_image_features_raw / transf_image_features_raw.norm(
+                    dim=-1, keepdim=True
+                )
+
+                outputs = transf_image_features @ transf_text_features.T
+                outputs_gda = transf_image_features_raw_ @ self._network.W + self._network.b
+                outputs_gda = outputs_gda / outputs_gda.norm(dim=-1, keepdim=True)
+                outputs_rerank = self._network.rerank(
+                    self.des_dict, outputs, transf_image_features_raw, class_to_label,
+                    self._device, self.args["rerank_top"],
+                )
+                outputs = outputs_gda * self.args["stat"] + (
+                    self.args["rerank"] * outputs_rerank + (1 - self.args["rerank"]) * outputs
+                ) * (1 - self.args["stat"])
+
+            logits_list.append(outputs.cpu().numpy())
+            targets_list.append(targets.cpu().numpy())
+
+        cil_logits = _np.concatenate(logits_list, axis=0)
+        cil_targets = _np.concatenate(targets_list, axis=0)
+        return cil_logits, cil_targets

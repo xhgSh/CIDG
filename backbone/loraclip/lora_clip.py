@@ -11,8 +11,19 @@ from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from tqdm import tqdm
 
-import clip
-from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer # use default clip's tokenization
+try:
+    import clip
+    from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer  # use default clip's tokenization
+except ImportError:
+    import open_clip
+    _open_clip_tok = open_clip.get_tokenizer("ViT-B-16")
+    class _Tokenizer:
+        pass  # dummy; tokenize() uses clip.tokenize below
+    class _ClipShim:
+        @staticmethod
+        def tokenize(texts, truncate=False):
+            return _open_clip_tok(texts)
+    clip = _ClipShim()
 
 from .model import build_LoRA_model
 
@@ -135,9 +146,23 @@ def load(name: str,
     #     model_path = name
     # else:
     #     raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
-    #这里修改了
-    #model_path = '/data2/zhoudw/sunh/ss/pretrained/ViT-B-16.pt'
-    model_path ="/data/zhoudw/sunh/ss/pretrained/open_clip_pytorch_model.bin"
+    # Prefer path from name if it is an existing file; else try common paths
+    if isinstance(name, str) and os.path.isfile(name):
+        model_path = name
+    else:
+        for candidate in [
+            "/data/zhoudw/sunh/ss/pretrained/open_clip_pytorch_model.bin",
+            "./c.pth",
+            "open_clip_pytorch_model.bin",
+        ]:
+            if os.path.isfile(candidate):
+                model_path = candidate
+                break
+        else:
+            raise RuntimeError(
+                "LoRA-CLIP checkpoint not found. Set 'clip_ckpt_path' in config to a valid .pth/.bin path, "
+                "or place a checkpoint at ./c.pth or open_clip_pytorch_model.bin"
+            )
     with open(model_path, 'rb') as opened_file:
         try:
             # loading JIT archive
